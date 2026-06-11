@@ -1,0 +1,16 @@
+# JitPack 构建环境配置
+# 参考：https://jitpack.io/docs/BUILDING/
+
+# 使用 JDK 17（Android Gradle Plugin 8.x 兼容）
+jdk:
+  - openjdk17
+
+# 构建前安装 Android SDK 组件
+install:
+  - sdkmanager --install "ndk;21.0.6113669"
+  - sdkmanager --install "cmake;3.18.1"
+
+# 限制构建内存，避免 OOM
+env:
+  JAVA_OPTS: "-Xms1g -Xmx3g"
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.parallel=true"
