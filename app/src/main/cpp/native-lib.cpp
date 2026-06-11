@@ -47,6 +47,8 @@ std::string app_record_folder = "/sdcard/";  // Public directory for recordings 
 std::string app_private_folder = "/sdcard/"; // Private external files directory (app has full access)
 std::string save_folder = "/sdcard/";
 std::ofstream imu_csv;
+std::ofstream pose_ext_csv;
+std::mutex pose_ext_csv_mtx;
 
 //=========================================================
 // OPENVINS SPECIFIC VARS - START
@@ -105,25 +107,23 @@ std::mutex trajectory_mtx;
 const size_t MAX_TRAJECTORY_POINTS = 10000; // Limit trajectory size
 
 // JNI OnLoad/OnUnload handlers for proper cleanup
-JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
-  return JNI_VERSION_1_6;
-}
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) { return JNI_VERSION_1_6; }
 
 JNIEXPORT void JNICALL JNI_OnUnload(JavaVM *vm, void *reserved) {
   // Ensure all threads are stopped and resources are cleaned up
   __android_log_print(ANDROID_LOG_INFO, TAG, "JNI_OnUnload: cleaning up resources\n");
-  
+
   // Stop the worker thread if running
   if (thread_running) {
     thread_should_run = false;
     processing_cv.notify_all();
-    
+
     // Wait for thread to finish (with timeout)
     if (processing_thread.joinable()) {
       processing_thread.join();
     }
   }
-  
+
   // Clean up VIO system
   {
     std::lock_guard<std::mutex> lck(camera_queue_mtx);
@@ -131,12 +131,15 @@ JNIEXPORT void JNICALL JNI_OnUnload(JavaVM *vm, void *reserved) {
     camera_queue.clear();
     camera_last_timestamp.clear();
   }
-  
+
   // Close IMU CSV if open
   if (imu_csv.is_open()) {
     imu_csv.close();
   }
-  
+  if (pose_ext_csv.is_open()) {
+    pose_ext_csv.close();
+  }
+
   __android_log_print(ANDROID_LOG_INFO, TAG, "JNI_OnUnload: cleanup complete\n");
 }
 
@@ -355,12 +358,16 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_MainActivity_setReco
     // Open our IMU csv file
     imu_csv.open(save_folder + "imu0.csv");
     imu_csv << "timestamp,omega_x,omega_y,omega_z,alpha_x,alpha_y,alpha_z" << std::endl;
-
+    pose_ext_csv.open(save_folder + "pose0.csv");
+    pose_ext_csv << "timestamp,p_x,p_y,p_z,q_x,q_y,q_z,q_w" << std::endl;
   } else {
 
     // If the file was open, then close it
     if (imu_csv.is_open()) {
       imu_csv.close();
+    }
+    if (pose_ext_csv.is_open()) {
+      pose_ext_csv.close();
     }
   }
 }
@@ -897,6 +904,12 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_openvins_android_MainActivity_get
   jdouble pos[3] = {p_cam(0), p_cam(1), p_cam(2)};
   // Convert JPL [qx, qy, qz, qw] to Hamilton [qw, qx, qy, qz] for Java
   jdouble quat[4] = {q_cam(3), q_cam(0), q_cam(1), q_cam(2)};
+
+  if (is_recording && pose_ext_csv.is_open()) {
+    unsigned long long time_in_ns = (unsigned long long)(state->_timestamp * 1e9);
+    pose_ext_csv << time_in_ns << "," << p_cam(0) << "," << p_cam(1) << "," << p_cam(2) << "," << q_cam(0) << "," << q_cam(1) << "," << q_cam(2)
+                 << "," << q_cam(3) << std::endl;
+  }
 
   env->SetDoubleArrayRegion(position, 0, 3, pos);
   env->SetDoubleArrayRegion(quaternion, 0, 4, quat);
