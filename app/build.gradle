@@ -7,8 +7,6 @@ android {
     namespace "com.openvins.android"
     compileSdk 30
     ndkVersion "21.0.6113669"
-//    ndkVersion "22.1.7171670"
-//    ndkVersion "22.0.7026061"
 
     defaultConfig {
         applicationId "com.openvins.android"
@@ -17,19 +15,7 @@ android {
         versionCode 1
         versionName "1.0"
 
-
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
-        externalNativeBuild {
-            cmake {
-                cppFlags "-std=c++11 -frtti -fexceptions"
-                abiFilters 'arm64-v8a' // 'armeabi-v7a','x86', 'x86_64',
-                arguments "-DOpenCV_DIR=" + project(':thirdparty:opencv').projectDir.absolutePath + "/native",
-                        "-DBOOST_DIR=" + project(':thirdparty:boost').projectDir.absolutePath,
-                        "-DEIGEN3_DIR=" + project(':thirdparty:eigen3').projectDir.absolutePath,
-                        "-DANDROID_ARM_NEON=ON",
-                        "-DANDROID_STL=c++_shared"
-            }
-        }
     }
     signingConfigs {
         release {
@@ -46,11 +32,7 @@ android {
             signingConfig signingConfigs.release
         }
     }
-    externalNativeBuild {
-        cmake {
-            path "src/main/cpp/CMakeLists.txt"
-        }
-    }
+    // CMake 构建已移至 openvins-lib 模块，app 模块不再需要
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_1_8
         targetCompatibility JavaVersion.VERSION_1_8
@@ -69,9 +51,8 @@ dependencies {
     testImplementation 'junit:junit:4.+'
     androidTestImplementation 'androidx.test.ext:junit:1.1.1'
     androidTestImplementation 'androidx.test.espresso:espresso-core:3.2.0'
-    implementation project(':thirdparty:opencv')
-    implementation project(':thirdparty:opencv')
-    //implementation project(':open_vins')
+    // 依赖 OpenVINS 库模块
+    implementation project(':openvins-lib')
 }
 
 // Task to sync app_device files to the device

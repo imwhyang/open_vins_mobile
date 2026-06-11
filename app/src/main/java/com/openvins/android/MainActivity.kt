@@ -21,14 +21,15 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import java.io.File
-import java.io.FileOutputStream
-import java.io.IOException
 import android.os.Handler
 import android.os.Looper
 import androidx.core.content.ContextCompat
 
 
 class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListener {
+
+    // OpenVINS 管理器（库的公开 API）
+    private val ovManager = OpenVINSManager()
 
     private var mOpenCvCameraView: Camera2ResView? = null
     private var isRecording: Boolean = false
@@ -64,11 +65,6 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     private val currentPosDouble = DoubleArray(3)  // 当前位置预分配数组
     private val currentQuatDouble = DoubleArray(4)  // 当前四元数预分配数组
 
-    init {
-        // Load native library
-        System.loadLibrary("native-lib")
-    }
-
     public override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -82,6 +78,10 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         trajectoryView = findViewById<Trajectory3DView>(R.id.trajectory_view)
         // Force initial render to show axes and grid
         trajectoryView?.forceRender()
+
+        findViewById<FloatingActionButton>(R.id.take_photo).setOnClickListener {
+            testTakeSnapshot()
+        }
 
         // Check that we have our accelerometer and gyroscope sensors
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -100,15 +100,8 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
             ).show()
         }
 
-        // 从 APK assets 复制配置文件到内部存储（无需任何权限）
-        // 使用内部存储（getFilesDir）而非外部存储（getExternalFilesDir），
-        // 因为 Android 11+ 的 Scoped Storage 限制可能导致外部存储 EACCES 错误
-        val configFolderRoot = filesDir.absolutePath  // 内部存储根目录
-        val configDir = configFolderRoot + "/config/"  // 配置文件子目录
-        File(configDir).mkdirs()  // 确保目录存在
-        copyConfigAssetsIfNeeded(configDir)  // 首次运行时从 assets 复制配置文件
-        // 将私有目录路径传递给 C++ 层（C++ 会拼接 /config/ 子目录）
-        setAppPrivateFolderJNI(configFolderRoot)
+        // 通过 OpenVINSManager 初始化配置文件（内部存储，无需权限）
+        ovManager.initConfig(this)
 
         // 检查是否已拥有存储权限（例如应用重启后权限仍保留）
         if (hasStoragePermissions()) {
@@ -148,7 +141,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
                         ).show()
                     } else {
                         hasRecordFolder = true
-                        setAppRecordFolderJNI(recordFolder)
+                        ovManager.setRecordFolder(recordFolder)
                     }
                 }
             })
@@ -175,7 +168,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
                 fab.setImageResource(R.drawable.ic_baseline_close_24)
                 true
             }
-            setRecordStateJNI(isRecording)
+            ovManager.setRecording(isRecording)
         }
 
         // Our start / stop openvins button
@@ -190,7 +183,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
                 trajectoryView?.clearTrajectory()
                 true
             }
-            toggleSystemJNI(isRunningOV)
+            ovManager.toggleSystem(isRunningOV)
         }
 
     }
@@ -272,12 +265,12 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         
         // Stop OpenVINS system and clean up native resources
         if (isRunningOV) {
-            toggleSystemJNI(false)
+            ovManager.toggleSystem(false)
         }
         
         // Stop recording if active
         if (isRecording) {
-            setRecordStateJNI(false)
+            ovManager.setRecording(false)
         }
         
         // Disable camera view
@@ -287,9 +280,8 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     }
 
     override fun onFrame(matAddr: Long, timestampSec: Double) {
-        // Native function processes the frame and updates it in-place
-        // Mat address is already from native code, so we can use it directly
-        processImageJNI(matAddr, timestampSec)
+        // 通过 OpenVINSManager 将帧数据传入 C++ 层处理
+        ovManager.processImage(matAddr, timestampSec)
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
@@ -297,29 +289,23 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         // First check if we have any new events
         when (event?.sensor?.type) {
             Sensor.TYPE_ACCELEROMETER -> {
-                //Log.e(TAG, "[acc]: ${event.values[0]}, ${event.values[1]}, ${event.values[2]}")
                 eventAccel = event
             }
             Sensor.TYPE_GYROSCOPE -> {
-                //Log.e(TAG, "[gyro]: ${event.values[0]}, ${event.values[1]}, ${event.values[2]}")
                 eventGyro = event
             }
         }
 
         // Next wait till we have both gyroscope and accelerometer
-        // TODO: we should try to be smarter about this selection as they could be
-        // TODO: out of sync and we should never know this...
         if (eventAccel != null && eventGyro != null) {
-            // Use the sensor event timestamp (nanoseconds since boot, converted to seconds)
-            // This ensures consistent timing with camera timestamps which also use boot time reference
             val timestampSec = (event!!.timestamp * 1e-9).toDouble()
-            processInertialJNI(
+            ovManager.processInertial(
                 eventAccel!!.values[0], eventAccel!!.values[1], eventAccel!!.values[2],
                 eventGyro!!.values[0], eventGyro!!.values[1], eventGyro!!.values[2],
                 timestampSec
-            );
-            eventAccel = null;
-            eventGyro = null;
+            )
+            eventAccel = null
+            eventGyro = null
         }
 
     }
@@ -327,33 +313,19 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     override fun onAccuracyChanged(p0: Sensor?, p1: Int) {
         Log.d(TAG, "[sensor]: accuracy level of ${p0.toString()} changed to $p1")
     }
-
-    private external fun setAppRecordFolderJNI(dir: String)
-    private external fun setAppPrivateFolderJNI(dir: String)
-    private external fun setRecordStateJNI(state: Boolean)
-    private external fun toggleSystemJNI(state: Boolean)
-    private external fun processImageJNI(matAddr: Long, timestampSec: Double)
-    private external fun processInertialJNI(
-        ax: Float, ay: Float, az: Float,
-        gx: Float, gy: Float, gz: Float,
-        timestampSec: Double
-    )
-    private external fun getCurrentPoseJNI(position: DoubleArray, quaternion: DoubleArray): Boolean
-    // Combined function: returns number of points copied (0 on error/empty)
-    // Arrays must be pre-allocated with sufficient size (max_size * 3 for positions, max_size * 4 for quaternions)
-    private external fun getTrajectoryDataJNI(positions: DoubleArray, quaternions: DoubleArray): Int
     
     private fun updateTrajectoryView() {
         if (trajectoryView == null) return
         if (!isRunningOV) return  // VIO 系统未运行时跳过更新，减少无效计算
 
-        // 获取当前位姿（复用预分配数组，避免每次分配新数组）
-        if (!getCurrentPoseJNI(currentPosDouble, currentQuatDouble)) {
+        // 通过 OpenVINSManager 获取当前位姿（复用预分配数组）
+        if (!ovManager.getCurrentPose(currentPosDouble, currentQuatDouble)) {
+            Log.d(TAG, "updateTrajectoryView Current pose not available yet")
             return // 系统尚未初始化
         }
 
-        // 获取轨迹数据（复用预分配数组，native 函数返回实际点数）
-        val trajectorySize = getTrajectoryDataJNI(trajectoryPositions, trajectoryQuaternions)
+        // 通过 OpenVINSManager 获取轨迹数据（复用预分配数组）
+        val trajectorySize = ovManager.getTrajectoryData(trajectoryPositions, trajectoryQuaternions)
 
         // 将当前位置转换为 Float 数组用于渲染
         val currPosFloats = FloatArray(3) { currentPosDouble[it].toFloat() }
@@ -362,6 +334,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         if (trajectorySize == 0) {
             trajectoryView?.updateTrajectory(floatArrayOf(), floatArrayOf(),
                 currPosFloats, currQuatFloats)
+            Log.d(TAG, "updateTrajectoryView No trajectory data available yet")
             return
         }
 
@@ -374,13 +347,15 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         for (i in 0 until quatCount) {
             trajectoryQuatFloats[i] = trajectoryQuaternions[i].toFloat()
         }
+        Log.d(TAG, "updateTrajectoryView Trajectory data updated" +
+            " size: $trajectorySize, posCount: $posCount, quatCount: $quatCount")
 
         // 更新 3D 视图 - 只复制预分配数组中的有效部分
-        trajectoryView?.updateTrajectory(
-            trajectoryPosFloats.copyOfRange(0, posCount),
-            trajectoryQuatFloats.copyOfRange(0, quatCount),
-            currPosFloats, currQuatFloats
-        )
+//        trajectoryView?.updateTrajectory(
+//            trajectoryPosFloats.copyOfRange(0, posCount),
+//            trajectoryQuatFloats.copyOfRange(0, quatCount),
+//            currPosFloats, currQuatFloats
+//        )
     }
 
     companion object {
@@ -401,7 +376,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     /**
      * 初始化记录文件夹（公共外部存储的 Documents 目录）。
      * 在 Android 11 以下设备需要 WRITE_EXTERNAL_STORAGE 权限。
-     * 配置文件已单独在 onCreate() 中使用内部存储处理（无需权限）。
+     * 配置文件已通过 OpenVINSManager.initConfig() 使用内部存储处理（无需权限）。
      */
     private fun initializeRecordFolder() {
         if (storageInitialized) return  // 防止重复初始化
@@ -424,50 +399,45 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
             ).show()
         } else {
             hasRecordFolder = true
-            // 将记录目录路径传递给 C++ 层
-            setAppRecordFolderJNI(recordFolder)
+            ovManager.setRecordFolder(recordFolder)
         }
 
         storageInitialized = true  // 标记已初始化
         Log.i(TAG, "Record folder initialized: $recordFolder")
     }
 
-    /**
-     * 将 APK assets 中的配置 YAML 文件复制到私有存储目录。
-     * 仅复制磁盘上不存在的文件，因此用户通过 sync_device.sh 推送的
-     * 自定义配置不会被覆盖。
-     */
-    private fun copyConfigAssetsIfNeeded(configDir: String) {
-        // 需要从 assets 复制的配置文件列表
-        val configAssets = listOf("estimator_config.yaml", "kalibr_imu_chain.yaml", "kalibr_imucam_chain.yaml")
-        var copied = 0
-        for (assetName in configAssets) {
-            val targetFile = File(configDir, assetName)
-            if (targetFile.exists()) {
-                // 文件已存在，跳过（保留用户可能的自定义修改）
-                Log.d(TAG, "Config file already exists: $assetName")
-                continue
-            }
-            try {
-                // 从 APK assets 中读取并写入到内部存储
-                assets.open("config/$assetName").use { input ->
-                    FileOutputStream(targetFile).use { output ->
-                        input.copyTo(output)
-                    }
-                }
-                Log.i(TAG, "Copied config asset to: $targetFile")
-                copied++
-            } catch (e: IOException) {
-                // 复制失败不影响应用启动，后续 YamlParser 会报告具体问题
-                Log.e(TAG, "Failed to copy config asset: $assetName", e)
-            }
-        }
-        if (copied > 0) {
-            Log.i(TAG, "Copied $copied config file(s) from assets to $configDir")
-        }
-    }
-
     init {
         Log.i(TAG, "Instantiated new " + this.javaClass)
+    }
+
+    /**
+     * 测试快照功能：保存当前预览画面为图片，同时获取位姿。
+     * 调用后会弹出 Toast 显示结果。
+     */
+    fun testTakeSnapshot() {
+        if (!isRunningOV) {
+            Toast.makeText(this, "VIO system not running", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!hasRecordFolder) {
+            Toast.makeText(this, "Record folder not set", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val snapshotDir = recordFolder + "snapshots/"
+        val dir = File(snapshotDir)
+        if (!dir.exists()) dir.mkdirs()
+
+        val result = ovManager.takeSnapshot(snapshotDir)
+        if (result.imagePath != null) {
+            val msg = "Snapshot saved!\n" +
+                "path: ${result.imagePath}\n" +
+                "pos: [${"%.3f".format(result.position[0])}, ${"%.3f".format(result.position[1])}, ${"%.3f".format(result.position[2])}]\n" +
+                "quat: [${"%.3f".format(result.quaternion[0])}, ${"%.3f".format(result.quaternion[1])}, ${"%.3f".format(result.quaternion[2])}, ${"%.3f".format(result.quaternion[3])}]"
+            Log.i(TAG, msg)
+            Toast.makeText(this, "Snapshot saved!\n${result.imagePath}", Toast.LENGTH_LONG).show()
+        } else {
+            Toast.makeText(this, "Snapshot failed (no image or not initialized)", Toast.LENGTH_LONG).show()
+        }
     }
 }
