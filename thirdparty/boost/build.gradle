@@ -13,6 +13,8 @@ android {
     defaultConfig {
         minSdkVersion 21
         targetSdkVersion 30
+//        ndkVersion "22.1.7171670"
+        ndkVersion "22.0.7026061"
 
         versionCode boostVersionCode
         versionName boostVersionName

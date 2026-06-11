@@ -53,6 +53,8 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
     private var mFrameListener: CameraFrameListener? = null
     private var mEnabled = false
     private var mCameraPermissionGranted = false
+    @Volatile
+    private var mCameraActive = false  // 相机活跃标志，防止在 ImageReader 关闭后仍访问 Image 对象
     
     // Temporary display bitmap
     private var mDisplayBitmap: Bitmap? = null
@@ -122,8 +124,11 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
 
     private fun disconnectCamera() {
         Log.i(TAG, "disconnectCamera")
-        val handler = mBackgroundHandler
-        
+
+        // 最先将相机标记为不活跃，阻止后续的 onImageAvailable 回调
+        // 访问即将被关闭的 Image 对象
+        mCameraActive = false
+
         // Close capture session first
         if (mCaptureSession != null) {
             try {
@@ -267,124 +272,153 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
                 return
             }
 
+            mCameraActive = true  // 标记相机为活跃状态，允许回调处理帧数据
             mImageReader = ImageReader.newInstance(w, h, mPreviewFormat, 2)
             mImageReader!!.setOnImageAvailableListener({ reader ->
-                val image = reader.acquireLatestImage()
+                // 第一层防护：若相机已不活跃（ImageReader 可能正在关闭或已关闭），直接跳过
+                if (!mCameraActive) {
+                    return@setOnImageAvailableListener
+                }
+
+                // 第二层防护：获取 Image 时捕获异常，防止 ImageReader 已关闭导致崩溃
+                val image: Image?
+                try {
+                    image = reader.acquireLatestImage()
+                } catch (e: IllegalStateException) {
+                    // ImageReader 已关闭，无法获取图像
+                    Log.w(TAG, "acquireLatestImage failed: ImageReader closed", e)
+                    return@setOnImageAvailableListener
+                }
                 if (image == null)
                     return@setOnImageAvailableListener
 
-                // Get hardware timestamp from the Image (nanoseconds since boot)
-                val frameTimestampNs = image.timestamp
-                lastFrameTimestampSec = frameTimestampNs * 1e-9
-
-                // Extract YUV plane data directly from Image
-                val planes = image.planes
-                val imgWidth = image.width
-                val imgHeight = image.height
-                
-                val yPlane = planes[0].buffer
-                val yStride = planes[0].rowStride
-                val uPlane = planes[1].buffer
-                val uStride = planes[1].rowStride
-                val uPixelStride = planes[1].pixelStride
-                val vPlane = if (planes.size > 2) planes[2].buffer else null
-                val vStride = if (vPlane != null) planes[2].rowStride else 0
-                
-                // Extract raw byte data - use buffer's actual capacity
-                yPlane.rewind()
-                val ySize = yPlane.remaining()
-                val yBytes = ByteArray(ySize)
-                yPlane.get(yBytes)
-                
-                val uBytes = if (uPlane != null) {
-                    uPlane.rewind()
-                    val uSize = uPlane.remaining()
-                    val bytes = ByteArray(uSize)
-                    uPlane.get(bytes)
-                    bytes
-                } else null
-                
-                val vBytes = if (vPlane != null) {
-                    vPlane.rewind()
-                    val vSize = vPlane.remaining()
-                    val bytes = ByteArray(vSize)
-                    vPlane.get(bytes)
-                    bytes
-                } else null
-                
-                // Convert YUV to RGBA in native code - returns Mat address
-                val rgbaMatAddr = processYUVToRGBAJNI(
-                    yBytes, uBytes, vBytes,
-                    imgWidth, imgHeight,
-                    yStride, uStride, vStride,
-                    uPixelStride
-                )
-                
-                if (rgbaMatAddr == 0L) {
-                    image.close()
-                    return@setOnImageAvailableListener
-                }
-                
                 try {
-                    // Notify listener with Mat address and timestamp (for processing)
-                    // processImageJNI will clone the Mat before queuing, so it's safe to delete after
-                    mFrameListener?.onFrame(rgbaMatAddr, lastFrameTimestampSec)
-                    
-                    // Get display image (raw camera if not running, or viz with overlays if running)
-                    // Note: getDisplayImageJNI creates a new Mat, so we can safely delete rgbaMatAddr after this
-                    val displayMatAddr = getDisplayImageJNI(rgbaMatAddr)
-                    
-                    // Now safe to delete the raw camera Mat since:
-                    // 1. processImageJNI has cloned the data it needs before queuing
-                    // 2. getDisplayImageJNI has created a new Mat and is done with the original
-                    deleteMatJNI(rgbaMatAddr)
-                    
-                    if (displayMatAddr != 0L) {
-                        try {
-                            // Use Java Mat wrapper temporarily to access Mat data for bitmap conversion
-                            val displayMat = Mat(displayMatAddr)
-                            synchronized(mDisplayLock) {
-                                val displayWidth = displayMat.width()
-                                val displayHeight = displayMat.height()
-                                if (mDisplayBitmap == null || mDisplayBitmap!!.width != displayWidth || mDisplayBitmap!!.height != displayHeight) {
-                                    mDisplayBitmap?.recycle()
-                                    mDisplayBitmap = Bitmap.createBitmap(displayWidth, displayHeight, Bitmap.Config.ARGB_8888)
+                    // 第三层防护：获取 Image 后再次检查活跃状态，可能在获取期间相机正在关闭
+                    if (!mCameraActive) {
+                        image.close()
+                        return@setOnImageAvailableListener
+                    }
+
+                    // Get hardware timestamp from the Image (nanoseconds since boot)
+                    val frameTimestampNs = image.timestamp
+                    lastFrameTimestampSec = frameTimestampNs * 1e-9
+
+                    // Extract YUV plane data directly from Image
+                    val planes = image.planes
+                    val imgWidth = image.width
+                    val imgHeight = image.height
+
+                    val yPlane = planes[0].buffer
+                    val yStride = planes[0].rowStride
+                    val uPlane = planes[1].buffer
+                    val uStride = planes[1].rowStride
+                    val uPixelStride = planes[1].pixelStride
+                    val vPlane = if (planes.size > 2) planes[2].buffer else null
+                    val vStride = if (vPlane != null) planes[2].rowStride else 0
+
+                    // Extract raw byte data - use buffer's actual capacity
+                    yPlane.rewind()
+                    val ySize = yPlane.remaining()
+                    val yBytes = ByteArray(ySize)
+                    yPlane.get(yBytes)
+
+                    val uBytes = if (uPlane != null) {
+                        uPlane.rewind()
+                        val uSize = uPlane.remaining()
+                        val bytes = ByteArray(uSize)
+                        uPlane.get(bytes)
+                        bytes
+                    } else null
+
+                    val vBytes = if (vPlane != null) {
+                        vPlane.rewind()
+                        val vSize = vPlane.remaining()
+                        val bytes = ByteArray(vSize)
+                        vPlane.get(bytes)
+                        bytes
+                    } else null
+
+                    // Convert YUV to RGBA in native code - returns Mat address
+                    val rgbaMatAddr = processYUVToRGBAJNI(
+                        yBytes, uBytes, vBytes,
+                        imgWidth, imgHeight,
+                        yStride, uStride, vStride,
+                        uPixelStride
+                    )
+
+                    if (rgbaMatAddr == 0L) {
+                        return@setOnImageAvailableListener
+                    }
+
+                    try {
+                        // Notify listener with Mat address and timestamp (for processing)
+                        // processImageJNI will clone the Mat before queuing, so it's safe to delete after
+                        mFrameListener?.onFrame(rgbaMatAddr, lastFrameTimestampSec)
+
+                        // Get display image (raw camera if not running, or viz with overlays if running)
+                        // Note: getDisplayImageJNI creates a new Mat, so we can safely delete rgbaMatAddr after this
+                        val displayMatAddr = getDisplayImageJNI(rgbaMatAddr)
+
+                        // Now safe to delete the raw camera Mat since:
+                        // 1. processImageJNI has cloned the data it needs before queuing
+                        // 2. getDisplayImageJNI has created a new Mat and is done with the original
+                        deleteMatJNI(rgbaMatAddr)
+
+                        if (displayMatAddr != 0L) {
+                            try {
+                                // Use Java Mat wrapper temporarily to access Mat data for bitmap conversion
+                                val displayMat = Mat(displayMatAddr)
+                                synchronized(mDisplayLock) {
+                                    val displayWidth = displayMat.width()
+                                    val displayHeight = displayMat.height()
+                                    if (mDisplayBitmap == null || mDisplayBitmap!!.width != displayWidth || mDisplayBitmap!!.height != displayHeight) {
+                                        mDisplayBitmap?.recycle()
+                                        mDisplayBitmap = Bitmap.createBitmap(displayWidth, displayHeight, Bitmap.Config.ARGB_8888)
+                                    }
+                                    // Convert Mat to Bitmap
+                                    Utils.matToBitmap(displayMat, mDisplayBitmap!!)
+
+                                    // Draw to surface on UI thread
+                                    post {
+                                        drawFrame()
+                                    }
                                 }
-                                // Convert Mat to Bitmap
-                                Utils.matToBitmap(displayMat, mDisplayBitmap!!)
-                                
-                                // Draw to surface on UI thread
-                                post {
-                                    drawFrame()
+                                // Delete the Mat manually (created with 'new' in C++)
+                                // Set nativeObj to 0 first to prevent Java finalizer from double-deleting
+                                val field = Mat::class.java.getDeclaredField("nativeObj")
+                                field.isAccessible = true
+                                field.setLong(displayMat, 0L)
+                                deleteMatJNI(displayMatAddr)
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Error displaying frame", e)
+                                // Make sure we still delete the Mat even if there's an error
+                                if (displayMatAddr != 0L) {
+                                    deleteMatJNI(displayMatAddr)
                                 }
                             }
-                            // Delete the Mat manually (created with 'new' in C++)
-                            // Set nativeObj to 0 first to prevent Java finalizer from double-deleting
-                            val field = Mat::class.java.getDeclaredField("nativeObj")
-                            field.isAccessible = true
-                            field.setLong(displayMat, 0L)
-                            deleteMatJNI(displayMatAddr)
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Error displaying frame", e)
-                            // Make sure we still delete the Mat even if there's an error
-                            if (displayMatAddr != 0L) {
-                                deleteMatJNI(displayMatAddr)
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error processing frame", e)
+                        // Make sure we still delete the Mat even if there's an error
+                        if (rgbaMatAddr != 0L) {
+                            try {
+                                deleteMatJNI(rgbaMatAddr)
+                            } catch (e2: Exception) {
+                                Log.e(TAG, "Error deleting Mat", e2)
                             }
                         }
                     }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error processing frame", e)
-                    // Make sure we still delete the Mat even if there's an error
-                    if (rgbaMatAddr != 0L) {
-                        try {
-                            deleteMatJNI(rgbaMatAddr)
-                        } catch (e2: Exception) {
-                            Log.e(TAG, "Error deleting Mat", e2)
-                        }
+                } catch (e: IllegalStateException) {
+                    // Image 已被关闭（如 disconnectCamera 期间 ImageReader 被关闭）
+                    Log.w(TAG, "Image already closed, skipping frame", e)
+                } finally {
+                    // 确保 Image 被关闭，防止内存泄漏
+                    try {
+                        image.close()
+                    } catch (e: IllegalStateException) {
+                        // Image 已关闭，无需重复处理
                     }
                 }
-                
-                image.close()
             }, mBackgroundHandler)
             
             mPreviewRequestBuilder = mCameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)

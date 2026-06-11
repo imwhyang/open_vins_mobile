@@ -715,7 +715,25 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_MainActivity_process
                           errno);
     }
 
-    auto parser = std::make_shared<ov_core::YamlParser>(config_path, true);
+    // 防御性异常捕获：防止 YamlParser 构造时因文件权限等问题
+    // 抛出未捕获异常导致 SIGABRT 崩溃
+    std::shared_ptr<ov_core::YamlParser> parser;
+    try {
+      parser = std::make_shared<ov_core::YamlParser>(config_path, true);
+    } catch (const boost::filesystem::filesystem_error &e) {
+      // boost::filesystem 在权限被拒绝时会抛出 filesystem_error 异常
+      __android_log_print(ANDROID_LOG_ERROR, TAG, "Failed to create YamlParser: %s\n", e.what());
+      return;
+    } catch (const std::exception &e) {
+      // 捕获其他可能的异常
+      __android_log_print(ANDROID_LOG_ERROR, TAG, "Failed to create YamlParser: %s\n", e.what());
+      return;
+    }
+    if (parser == nullptr) {
+      // YamlParser 创建失败（理论上不会走到这里，但做防御性检查）
+      __android_log_print(ANDROID_LOG_ERROR, TAG, "Failed to create YamlParser (null)\n");
+      return;
+    }
     ov_msckf::VioManagerOptions params;
     params.print_and_load(parser);
 

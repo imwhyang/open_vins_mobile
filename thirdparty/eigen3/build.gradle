@@ -13,7 +13,8 @@ android {
     defaultConfig {
         minSdkVersion 21
         targetSdkVersion 30
-
+//        ndkVersion "22.0.7026061"
+        ndkVersion "21.0.6113669"
         versionCode eigen3VersionCode
         versionName eigen3VersionName
     }

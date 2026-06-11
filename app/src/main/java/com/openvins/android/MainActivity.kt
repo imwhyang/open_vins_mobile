@@ -21,8 +21,11 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
 import android.os.Handler
 import android.os.Looper
+import androidx.core.content.ContextCompat
 
 
 class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListener {
@@ -32,6 +35,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     private var isRunningOV: Boolean = false
     private var hasRecordFolder: Boolean = false
     private var recordFolder: String = ""
+    private var storageInitialized: Boolean = false  // 记录文件夹是否已初始化（避免重复初始化）
 
     private lateinit var sensorManager: SensorManager
     private var sensorAccel: Sensor? = null
@@ -44,9 +48,21 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     private val trajectoryUpdateRunnable = object : Runnable {
         override fun run() {
             updateTrajectoryView()
-            trajectoryUpdateHandler.postDelayed(this, 50) // 20 Hz
+            // 每 100ms 更新一次（10Hz），从原来的 50ms（20Hz）降低频率以避免 ANR
+            trajectoryUpdateHandler.postDelayed(this, 100)
         }
     }
+
+    // 预分配轨迹数据数组，避免每次 updateTrajectoryView() 调用时分配新数组
+    // 之前每 50ms 分配约 560KB 临时数组（DoubleArray(30000)+DoubleArray(40000)+Float 转换），
+    // 产生约 11MB/s 垃圾导致频繁 GC，引发主线程 ANR
+    private val maxTrajectoryPoints = 10000  // 最大轨迹点数
+    private val trajectoryPositions = DoubleArray(maxTrajectoryPoints * 3)  // 预分配位置数组（x,y,z 交替存储）
+    private val trajectoryQuaternions = DoubleArray(maxTrajectoryPoints * 4)  // 预分配四元数数组（x,y,z,w 交替存储）
+    private val trajectoryPosFloats = FloatArray(maxTrajectoryPoints * 3)  // 位置 Float 数组（用于渲染）
+    private val trajectoryQuatFloats = FloatArray(maxTrajectoryPoints * 4)  // 四元数 Float 数组（用于渲染）
+    private val currentPosDouble = DoubleArray(3)  // 当前位置预分配数组
+    private val currentQuatDouble = DoubleArray(4)  // 当前四元数预分配数组
 
     init {
         // Load native library
@@ -57,17 +73,6 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // Permissions for Android 6+
-        ActivityCompat.requestPermissions(
-            this@MainActivity,
-            arrayOf(
-                Manifest.permission.CAMERA,
-                Manifest.permission.READ_EXTERNAL_STORAGE,
-                Manifest.permission.WRITE_EXTERNAL_STORAGE
-            ),
-            PERMISSION_REQUEST
-        )
-
         // Setup our camera
         setContentView(R.layout.activity_main)
         mOpenCvCameraView = findViewById<View>(R.id.test_view) as Camera2ResView
@@ -77,8 +82,6 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         trajectoryView = findViewById<Trajectory3DView>(R.id.trajectory_view)
         // Force initial render to show axes and grid
         trajectoryView?.forceRender()
-        //mOpenCvCameraView!!.setMaxFrameSize(640, 480)
-        //mOpenCvCameraView!!.setFocusMode(this, Camera.Parameters.FOCUS_MODE_INFINITY)
 
         // Check that we have our accelerometer and gyroscope sensors
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -93,48 +96,35 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         if (sensorGyro == null) {
             Toast.makeText(
                 applicationContext,
-                "ERROR: unable to open accelerometer", Toast.LENGTH_LONG
+                "ERROR: unable to open sensorGyro", Toast.LENGTH_LONG
             ).show()
         }
 
-        // Our open folder button
-        // Use private external files directory root for config (app has full access)
-        // But use public Documents for recordings (user accessible)
-        val appPrivateFolderRoot = getExternalFilesDir(null)?.toString() ?: ""
-        val appRecordFolder =
-            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
-                .toString() + "/openvins/"
-        
-        // Ensure private config directory exists
-        val privateConfigDir = appPrivateFolderRoot + "/config/"
-        File(privateConfigDir).mkdirs()
-        
-        // Config files should be in private directory (pushed by sync script)
-        val privateConfigFile = File(privateConfigDir + "estimator_config.yaml")
-        if (!privateConfigFile.exists()) {
-            Log.w(TAG, "Config files not found in private directory. Please run sync script to push config files.")
-        } else {
-            Log.i(TAG, "Config files found in private directory")
+        // 从 APK assets 复制配置文件到内部存储（无需任何权限）
+        // 使用内部存储（getFilesDir）而非外部存储（getExternalFilesDir），
+        // 因为 Android 11+ 的 Scoped Storage 限制可能导致外部存储 EACCES 错误
+        val configFolderRoot = filesDir.absolutePath  // 内部存储根目录
+        val configDir = configFolderRoot + "/config/"  // 配置文件子目录
+        File(configDir).mkdirs()  // 确保目录存在
+        copyConfigAssetsIfNeeded(configDir)  // 首次运行时从 assets 复制配置文件
+        // 将私有目录路径传递给 C++ 层（C++ 会拼接 /config/ 子目录）
+        setAppPrivateFolderJNI(configFolderRoot)
+
+        // 检查是否已拥有存储权限（例如应用重启后权限仍保留）
+        if (hasStoragePermissions()) {
+            initializeRecordFolder()  // 已有权限，直接初始化记录文件夹
         }
-        
-        // Use private directory root for config, public directory for recordings
-        recordFolder = appRecordFolder
-        
-        // Automatically set the record folder without showing popup
-        val file = File(recordFolder)
-        if ((!file.isDirectory && !file.mkdirs()) || file.isFile) {
-            Toast.makeText(
-                applicationContext,
-                "ERROR: unable to create directory. ${file.toString()}",
-                Toast.LENGTH_LONG
-            ).show()
-        } else {
-            hasRecordFolder = true
-            // Set recording directory (public, for user access)
-            setAppRecordFolderJNI(recordFolder)
-            // Set private folder root (native code will add /config/ subdirectory)
-            setAppPrivateFolderJNI(appPrivateFolderRoot)
-        }
+
+        // 请求 Android 6+ 运行时权限（相机 + 存储）
+        ActivityCompat.requestPermissions(
+            this@MainActivity,
+            arrayOf(
+                Manifest.permission.CAMERA,
+                Manifest.permission.READ_EXTERNAL_STORAGE,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE
+            ),
+            PERMISSION_REQUEST
+        )
 
         // Button for the user to change if they want to do that
         val fab_folder = findViewById(R.id.open_folder) as FloatingActionButton
@@ -212,12 +202,26 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     ) {
         when (requestCode) {
             PERMISSION_REQUEST -> {
-                if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                val cameraGranted = grantResults.isNotEmpty() &&
+                    grantResults.getOrNull(0) == PackageManager.PERMISSION_GRANTED
+                val storageGranted = grantResults.size > 1 &&
+                    grantResults.getOrNull(1) == PackageManager.PERMISSION_GRANTED &&
+                    grantResults.getOrNull(2) == PackageManager.PERMISSION_GRANTED
+
+                // 相机权限：启动相机预览
+                if (cameraGranted) {
                     mOpenCvCameraView!!.setCameraPermissionGranted()
                 } else {
                     Log.e(TAG, "Camera permission was not granted")
                     Toast.makeText(this, "Camera permission was not granted", Toast.LENGTH_LONG)
                         .show()
+                }
+
+                // 存储权限：初始化记录文件夹（仅首次授权时执行）
+                if (storageGranted && !storageInitialized) {
+                    initializeRecordFolder()
+                } else if (!storageGranted) {
+                    Log.w(TAG, "Storage permission was not granted, recording may not work")
                 }
             }
             else -> {
@@ -341,52 +345,126 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     
     private fun updateTrajectoryView() {
         if (trajectoryView == null) return
-        
-        // Get current pose
-        val currentPos = DoubleArray(3)
-        val currentQuat = DoubleArray(4)
-        if (!getCurrentPoseJNI(currentPos, currentQuat)) {
-            return // System not initialized
+        if (!isRunningOV) return  // VIO 系统未运行时跳过更新，减少无效计算
+
+        // 获取当前位姿（复用预分配数组，避免每次分配新数组）
+        if (!getCurrentPoseJNI(currentPosDouble, currentQuatDouble)) {
+            return // 系统尚未初始化
         }
-        
-        // Allocate arrays with maximum expected size (MAX_TRAJECTORY_POINTS = 10000)
-        // The native function will return the actual number of points copied
-        val maxSize = 10000
-        val positions = DoubleArray(maxSize * 3)
-        val quaternions = DoubleArray(maxSize * 4)
-        
-        // Get trajectory data atomically (size and data in one call)
-        // This prevents race conditions where size could change between separate calls
-        val trajectorySize = getTrajectoryDataJNI(positions, quaternions)
-        
+
+        // 获取轨迹数据（复用预分配数组，native 函数返回实际点数）
+        val trajectorySize = getTrajectoryDataJNI(trajectoryPositions, trajectoryQuaternions)
+
+        // 将当前位置转换为 Float 数组用于渲染
+        val currPosFloats = FloatArray(3) { currentPosDouble[it].toFloat() }
+        val currQuatFloats = FloatArray(4) { currentQuatDouble[it].toFloat() }
+
         if (trajectorySize == 0) {
-            // Empty trajectory or error
-            trajectoryView?.updateTrajectory(floatArrayOf(), floatArrayOf(), 
-                FloatArray(3) { currentPos[it].toFloat() }, 
-                FloatArray(4) { currentQuat[it].toFloat() })
+            trajectoryView?.updateTrajectory(floatArrayOf(), floatArrayOf(),
+                currPosFloats, currQuatFloats)
             return
         }
-        
-        // Convert only the actual number of points to float arrays
-        val posFloats = FloatArray(trajectorySize * 3)
-        val quatFloats = FloatArray(trajectorySize * 4)
-        for (i in 0 until trajectorySize * 3) {
-            posFloats[i] = positions[i].toFloat()
+
+        // 仅转换实际点数的 Double→Float（复用预分配数组）
+        val posCount = trajectorySize * 3
+        val quatCount = trajectorySize * 4
+        for (i in 0 until posCount) {
+            trajectoryPosFloats[i] = trajectoryPositions[i].toFloat()
         }
-        for (i in 0 until trajectorySize * 4) {
-            quatFloats[i] = quaternions[i].toFloat()
+        for (i in 0 until quatCount) {
+            trajectoryQuatFloats[i] = trajectoryQuaternions[i].toFloat()
         }
-        
-        val currPosFloats = FloatArray(3) { currentPos[it].toFloat() }
-        val currQuatFloats = FloatArray(4) { currentQuat[it].toFloat() }
-        
-        // Update the 3D view
-        trajectoryView?.updateTrajectory(posFloats, quatFloats, currPosFloats, currQuatFloats)
+
+        // 更新 3D 视图 - 只复制预分配数组中的有效部分
+        trajectoryView?.updateTrajectory(
+            trajectoryPosFloats.copyOfRange(0, posCount),
+            trajectoryQuatFloats.copyOfRange(0, quatCount),
+            currPosFloats, currQuatFloats
+        )
     }
 
     companion object {
         private const val TAG = "MainActivity"
         private const val PERMISSION_REQUEST = 1
+    }
+
+    /**
+     * 检查是否已获取存储读写权限。
+     */
+    private fun hasStoragePermissions(): Boolean {
+        val writePermission = ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        val readPermission = ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE)
+        return writePermission == PackageManager.PERMISSION_GRANTED &&
+               readPermission == PackageManager.PERMISSION_GRANTED
+    }
+
+    /**
+     * 初始化记录文件夹（公共外部存储的 Documents 目录）。
+     * 在 Android 11 以下设备需要 WRITE_EXTERNAL_STORAGE 权限。
+     * 配置文件已单独在 onCreate() 中使用内部存储处理（无需权限）。
+     */
+    private fun initializeRecordFolder() {
+        if (storageInitialized) return  // 防止重复初始化
+
+        // 使用公共 Documents 目录存放记录数据（用户可访问）
+        val appRecordFolder =
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+                .toString() + "/openvins/"
+
+        // 设置记录文件夹路径
+        recordFolder = appRecordFolder
+
+        // 创建记录文件夹
+        val file = File(recordFolder)
+        if ((!file.isDirectory && !file.mkdirs()) || file.isFile) {
+            Toast.makeText(
+                applicationContext,
+                "ERROR: unable to create directory. ${file.toString()}",
+                Toast.LENGTH_LONG
+            ).show()
+        } else {
+            hasRecordFolder = true
+            // 将记录目录路径传递给 C++ 层
+            setAppRecordFolderJNI(recordFolder)
+        }
+
+        storageInitialized = true  // 标记已初始化
+        Log.i(TAG, "Record folder initialized: $recordFolder")
+    }
+
+    /**
+     * 将 APK assets 中的配置 YAML 文件复制到私有存储目录。
+     * 仅复制磁盘上不存在的文件，因此用户通过 sync_device.sh 推送的
+     * 自定义配置不会被覆盖。
+     */
+    private fun copyConfigAssetsIfNeeded(configDir: String) {
+        // 需要从 assets 复制的配置文件列表
+        val configAssets = listOf("estimator_config.yaml", "kalibr_imu_chain.yaml", "kalibr_imucam_chain.yaml")
+        var copied = 0
+        for (assetName in configAssets) {
+            val targetFile = File(configDir, assetName)
+            if (targetFile.exists()) {
+                // 文件已存在，跳过（保留用户可能的自定义修改）
+                Log.d(TAG, "Config file already exists: $assetName")
+                continue
+            }
+            try {
+                // 从 APK assets 中读取并写入到内部存储
+                assets.open("config/$assetName").use { input ->
+                    FileOutputStream(targetFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                Log.i(TAG, "Copied config asset to: $targetFile")
+                copied++
+            } catch (e: IOException) {
+                // 复制失败不影响应用启动，后续 YamlParser 会报告具体问题
+                Log.e(TAG, "Failed to copy config asset: $assetName", e)
+            }
+        }
+        if (copied > 0) {
+            Log.i(TAG, "Copied $copied config file(s) from assets to $configDir")
+        }
     }
 
     init {

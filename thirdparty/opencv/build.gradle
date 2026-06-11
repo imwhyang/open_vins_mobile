@@ -98,7 +98,8 @@ println "OpenCV: " +openCVersionName + " " + project.buildscript.sourceFile
 android {
     namespace "org.opencv"
     compileSdk 30
-
+//    ndkVersion "22.0.7026061"
+    ndkVersion "21.0.6113669"
     buildFeatures {
         buildConfig true
         aidl true
