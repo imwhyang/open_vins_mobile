@@ -1,4 +1,9 @@
-package com.openvins.android
+package com.openvins.app
+
+import com.openvins.android.Camera2ResView
+import com.openvins.android.CameraFrameListener
+import com.openvins.android.Trajectory3DView
+import com.openvins.android.VioEngine
 
 import android.Manifest
 import android.content.Context
@@ -48,9 +53,10 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         }
     }
 
+    private var vioEngine = VioEngine()
+
     init {
-        // Load native library
-        System.loadLibrary("native-lib")
+        Log.i(TAG, "Instantiated new " + this.javaClass)
     }
 
     public override fun onCreate(savedInstanceState: Bundle?) {
@@ -131,9 +137,9 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         } else {
             hasRecordFolder = true
             // Set recording directory (public, for user access)
-            setAppRecordFolderJNI(recordFolder)
+            vioEngine.setRecordFolder(recordFolder)
             // Set private folder root (native code will add /config/ subdirectory)
-            setAppPrivateFolderJNI(appPrivateFolderRoot)
+            vioEngine.setPrivateFolder(appPrivateFolderRoot)
         }
 
         // Button for the user to change if they want to do that
@@ -158,7 +164,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
                         ).show()
                     } else {
                         hasRecordFolder = true
-                        setAppRecordFolderJNI(recordFolder)
+                        vioEngine.setRecordFolder(recordFolder)
                     }
                 }
             })
@@ -185,7 +191,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
                 fab.setImageResource(R.drawable.ic_baseline_close_24)
                 true
             }
-            setRecordStateJNI(isRecording)
+            vioEngine.setRecording(isRecording)
         }
 
         // Our start / stop openvins button
@@ -200,7 +206,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
                 trajectoryView?.clearTrajectory()
                 true
             }
-            toggleSystemJNI(isRunningOV)
+            vioEngine.toggleSystem(isRunningOV)
         }
 
     }
@@ -268,12 +274,12 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         
         // Stop OpenVINS system and clean up native resources
         if (isRunningOV) {
-            toggleSystemJNI(false)
+            vioEngine.toggleSystem(false)
         }
         
         // Stop recording if active
         if (isRecording) {
-            setRecordStateJNI(false)
+            vioEngine.setRecording(false)
         }
         
         // Disable camera view
@@ -285,7 +291,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     override fun onFrame(matAddr: Long, timestampSec: Double) {
         // Native function processes the frame and updates it in-place
         // Mat address is already from native code, so we can use it directly
-        processImageJNI(matAddr, timestampSec)
+        vioEngine.processImage(matAddr, timestampSec)
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
@@ -309,7 +315,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
             // Use the sensor event timestamp (nanoseconds since boot, converted to seconds)
             // This ensures consistent timing with camera timestamps which also use boot time reference
             val timestampSec = (event!!.timestamp * 1e-9).toDouble()
-            processInertialJNI(
+            vioEngine.processImu(
                 eventAccel!!.values[0], eventAccel!!.values[1], eventAccel!!.values[2],
                 eventGyro!!.values[0], eventGyro!!.values[1], eventGyro!!.values[2],
                 timestampSec
@@ -324,40 +330,22 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         Log.d(TAG, "[sensor]: accuracy level of ${p0.toString()} changed to $p1")
     }
 
-    private external fun setAppRecordFolderJNI(dir: String)
-    private external fun setAppPrivateFolderJNI(dir: String)
-    private external fun setRecordStateJNI(state: Boolean)
-    private external fun toggleSystemJNI(state: Boolean)
-    private external fun processImageJNI(matAddr: Long, timestampSec: Double)
-    private external fun processInertialJNI(
-        ax: Float, ay: Float, az: Float,
-        gx: Float, gy: Float, gz: Float,
-        timestampSec: Double
-    )
-    private external fun getCurrentPoseJNI(position: DoubleArray, quaternion: DoubleArray): Boolean
-    // Combined function: returns number of points copied (0 on error/empty)
-    // Arrays must be pre-allocated with sufficient size (max_size * 3 for positions, max_size * 4 for quaternions)
-    private external fun getTrajectoryDataJNI(positions: DoubleArray, quaternions: DoubleArray): Int
-    
     private fun updateTrajectoryView() {
         if (trajectoryView == null) return
         
         // Get current pose
         val currentPos = DoubleArray(3)
         val currentQuat = DoubleArray(4)
-        if (!getCurrentPoseJNI(currentPos, currentQuat)) {
+        if (!vioEngine.getCurrentPose(currentPos, currentQuat)) {
             return // System not initialized
         }
         
         // Allocate arrays with maximum expected size (MAX_TRAJECTORY_POINTS = 10000)
-        // The native function will return the actual number of points copied
         val maxSize = 10000
         val positions = DoubleArray(maxSize * 3)
         val quaternions = DoubleArray(maxSize * 4)
         
-        // Get trajectory data atomically (size and data in one call)
-        // This prevents race conditions where size could change between separate calls
-        val trajectorySize = getTrajectoryDataJNI(positions, quaternions)
+        val trajectorySize = vioEngine.getTrajectoryData(positions, quaternions)
         
         if (trajectorySize == 0) {
             // Empty trajectory or error
@@ -387,9 +375,5 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     companion object {
         private const val TAG = "MainActivity"
         private const val PERMISSION_REQUEST = 1
-    }
-
-    init {
-        Log.i(TAG, "Instantiated new " + this.javaClass)
     }
 }

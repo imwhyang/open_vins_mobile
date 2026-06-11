@@ -4,6 +4,6 @@ plugins {
 include ':thirdparty:opencv'
 include ':thirdparty:eigen3'
 include ':thirdparty:boost'
-//include ':open_vins'
+include ':openvins-lib'
 include ':app'
 rootProject.name = "open_vins_android"
