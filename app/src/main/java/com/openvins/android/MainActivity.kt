@@ -65,7 +65,6 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     }
 
 
-
     public override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -187,6 +186,22 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
             vioEngine.toggleSystem(isRunningOV)
 
             tvPose = findViewById(R.id.tv_pose)
+            val takePicButton = findViewById(R.id.take_photo) as FloatingActionButton
+            takePicButton.setOnClickListener {
+                val timestamp = System.currentTimeMillis() / 1000
+                val externalStoragePublicDirectory =
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+                        .toString() + "/openvins/pointPic/"
+                    mOpenCvCameraView!!.captureRawImage(externalStoragePublicDirectory + "/${timestamp}.jpg") { file ->
+                        if (file != null) {
+                            Toast.makeText(this, "Capture Success", Toast.LENGTH_LONG).show()
+                            Log.d(TAG, "Capture Success" + file.absolutePath)
+                        } else {
+                            Toast.makeText(this, "Capture Failed", Toast.LENGTH_LONG).show()
+                        }
+                    }
+
+            }
         }
 
     }
@@ -393,10 +408,16 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         val isRevisit = trajectoryRevisitor.searchRevisitTrajectory(
             positions, quaternions, currentPos, currentQuat
         )
-        tvPose?.text = String.format("Pose: currPosFloats: %f %f %f  isRevisit %b",currPosFloats[0],currPosFloats[1],currPosFloats[2],isRevisit)
-        if (isRevisit){
+        tvPose?.text = String.format(
+            "Pose: currPosFloats: %f %f %f  isRevisit %b",
+            currPosFloats[0],
+            currPosFloats[1],
+            currPosFloats[2],
+            isRevisit
+        )
+        if (isRevisit) {
             tvPose?.setTextColor(ContextCompat.getColor(this, R.color.red))
-        }else{
+        } else {
             tvPose?.setTextColor(ContextCompat.getColor(this, R.color.white))
         }
 

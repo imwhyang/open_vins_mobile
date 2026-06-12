@@ -3,6 +3,7 @@ package com.openvins.android
 import android.annotation.TargetApi
 import android.content.Context
 import android.graphics.ImageFormat
+import android.graphics.YuvImage
 import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -28,6 +29,7 @@ import org.opencv.android.Utils
 import org.opencv.core.Mat
 import org.opencv.imgproc.Imgproc
 import java.io.File
+import java.io.FileOutputStream
 import java.nio.ByteBuffer
 
 interface CameraFrameListener {
@@ -76,6 +78,14 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
     // Temporary display bitmap
     private var mDisplayBitmap: Bitmap? = null
     private val mDisplayLock = Object()
+
+    // ---- 原始帧截图相关 ----
+    @Volatile
+    private var mPendingCapturePath: String? = null
+    @Volatile
+    private var mPendingCaptureQuality: Int = 90
+    private var mCaptureCallbackHandler: Handler? = null
+    private var mCaptureCallback: ((File?) -> Unit)? = null
 
     init {
         holder.addCallback(this)
@@ -336,6 +346,21 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
                     bytes
                 } else null
                 
+                // ---- 原始帧截图：在 YUV 提取之后、VIO 处理之前检查挂起的捕获请求 ----
+                val pendingPath = mPendingCapturePath
+                if (pendingPath != null) {
+                    mPendingCapturePath = null
+                    val quality = mPendingCaptureQuality
+                    try {
+                        saveRawFrameAsJpeg(yBytes, uBytes, vBytes, imgWidth, imgHeight,
+                            yStride, uStride, vStride, uPixelStride,
+                            pendingPath, quality)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to capture raw frame", e)
+                        notifyCaptureResult(null)
+                    }
+                }
+
                 // Convert YUV to RGBA in native code - returns Mat address
                 val rgbaMatAddr = engine.processYUVToRGBA(
                     yBytes, uBytes, vBytes,
@@ -680,6 +705,94 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
 
     /** 当前是否正在录制 */
     fun isRecording(): Boolean = mIsRecording
+
+    /**
+     * 截取下一帧原始相机图像并保存为 JPEG 文件。
+     * 不依赖 VIO 引擎，不叠加任何处理，纯原始帧。
+     * 保存完成后通过 callback 回调返回 File 对象（回调在 UI 线程执行）。
+     * @param filePath 输出 JPEG 文件路径
+     * @param quality  JPEG 压缩质量（0-100），默认 90
+     * @param callback 保存完成后的回调，参数为保存的 File 或 null（失败时）
+     */
+    @JvmOverloads
+    fun captureRawImage(filePath: String, quality: Int = 90, callback: (File?) -> Unit) {
+        if (mCameraDevice == null) {
+            Log.w(TAG, "captureRawImage: camera not connected")
+            callback(null)
+            return
+        }
+        synchronized(mRecordingLock) {
+            mPendingCapturePath = filePath
+            mPendingCaptureQuality = quality
+            mCaptureCallbackHandler = Handler(android.os.Looper.getMainLooper())
+            mCaptureCallback = callback
+        }
+        Log.i(TAG, "Raw frame capture requested: $filePath")
+    }
+
+    /** 在后台线程中执行原始帧保存（从 onImageAvailable 调用） */
+    private fun saveRawFrameAsJpeg(
+        yBytes: ByteArray, uBytes: ByteArray?, vBytes: ByteArray?,
+        width: Int, height: Int,
+        yStride: Int, uStride: Int, vStride: Int, uPixelStride: Int,
+        filePath: String, quality: Int
+    ) {
+        val frameSize = width * height
+        val nv21 = ByteArray(frameSize * 3 / 2)
+
+        // 拷贝 Y 平面
+        if (yStride == width) {
+            System.arraycopy(yBytes, 0, nv21, 0, frameSize)
+        } else {
+            for (row in 0 until height) {
+                System.arraycopy(yBytes, row * yStride, nv21, row * width, width)
+            }
+        }
+
+        // 拷贝 VU 交织平面（NV21: V0 U0 V1 U1 ...）
+        val vuOffset = frameSize
+        val vuRows = height / 2
+        if (uPixelStride == 2 && uBytes != null && vBytes != null && uStride == width) {
+            // YUV_420_888 的 UV 已经是 NV21 布局（V 在前），直接拷贝 V 平面
+            val vuSize = frameSize / 2
+            System.arraycopy(vBytes, 0, nv21, vuOffset, minOf(vuSize, vBytes.size))
+        } else if (uBytes != null && vBytes != null) {
+            // 逐像素交织 V/U（NV21 顺序）
+            var vuPos = 0
+            for (row in 0 until vuRows) {
+                for (col in 0 until width / 2) {
+                    val vIdx = row * vStride + col * uPixelStride
+                    val uIdx = row * uStride + col * uPixelStride
+                    if (vIdx < vBytes.size && uIdx < uBytes.size && vuPos + 1 < nv21.size - vuOffset) {
+                        nv21[vuOffset + vuPos] = vBytes[vIdx]
+                        nv21[vuOffset + vuPos + 1] = uBytes[uIdx]
+                        vuPos += 2
+                    }
+                }
+            }
+        }
+
+        // 用 YuvImage 压缩为 JPEG
+        val outFile = File(filePath)
+        outFile.parentFile?.mkdirs()
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+        FileOutputStream(outFile).use { fos ->
+            yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), quality, fos)
+        }
+        Log.i(TAG, "Raw frame saved: $filePath (${width}x${height})")
+        notifyCaptureResult(outFile)
+    }
+
+    /** 将截图结果回调到 UI 线程 */
+    private fun notifyCaptureResult(file: File?) {
+        val handler = mCaptureCallbackHandler
+        val callback = mCaptureCallback
+        mCaptureCallbackHandler = null
+        mCaptureCallback = null
+        if (handler != null && callback != null) {
+            handler.post { callback(file) }
+        }
+    }
 
     /** 释放编码器和复用器资源（内部使用） */
     private fun releaseRecorder() {
