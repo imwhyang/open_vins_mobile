@@ -1,4 +1,9 @@
-package com.openvins.android
+package com.openvins.app
+
+import com.openvins.android.Camera2ResView
+import com.openvins.android.CameraFrameListener
+import com.openvins.android.Trajectory3DView
+import com.openvins.android.VioEngine
 
 import android.Manifest
 import android.content.Context
@@ -51,9 +56,10 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         }
     }
 
+    private var vioEngine = VioEngine()
+
     init {
-        // Load native library
-        System.loadLibrary("native-lib")
+        Log.i(TAG, "Instantiated new " + this.javaClass)
     }
 
     public override fun onCreate(savedInstanceState: Bundle?) {
@@ -100,44 +106,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
             ).show()
         }
 
-        // Our open folder button
-        // Use private external files directory root for config (app has full access)
-        // But use public Documents for recordings (user accessible)
-        val appPrivateFolderRoot = getExternalFilesDir(null)?.toString() ?: ""
-        val appRecordFolder =
-            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
-                .toString() + "/openvins/"
-        
-        // Ensure private config directory exists
-        val privateConfigDir = appPrivateFolderRoot + "/config/"
-        File(privateConfigDir).mkdirs()
-        
-        // Config files should be in private directory (pushed by sync script)
-        val privateConfigFile = File(privateConfigDir + "estimator_config.yaml")
-        if (!privateConfigFile.exists()) {
-            Log.w(TAG, "Config files not found in private directory. Please run sync script to push config files.")
-        } else {
-            Log.i(TAG, "Config files found in private directory")
-        }
-        
-        // Use private directory root for config, public directory for recordings
-        recordFolder = appRecordFolder
-        
-        // Automatically set the record folder without showing popup
-        val file = File(recordFolder)
-        if ((!file.isDirectory && !file.mkdirs()) || file.isFile) {
-            Toast.makeText(
-                applicationContext,
-                "ERROR: unable to create directory. ${file.toString()}",
-                Toast.LENGTH_LONG
-            ).show()
-        } else {
-            hasRecordFolder = true
-            // Set recording directory (public, for user access)
-            setAppRecordFolderJNI(recordFolder)
-            // Set private folder root (native code will add /config/ subdirectory)
-            setAppPrivateFolderJNI(appPrivateFolderRoot)
-        }
+        // 权限申请是异步的，存储相关初始化在 onRequestPermissionsResult 权限授予后执行
 
         // Button for the user to change if they want to do that
         val fab_folder = findViewById(R.id.open_folder) as FloatingActionButton
@@ -161,7 +130,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
                         ).show()
                     } else {
                         hasRecordFolder = true
-                        setAppRecordFolderJNI(recordFolder)
+                        vioEngine.setRecordFolder(recordFolder)
                     }
                 }
             })
@@ -188,7 +157,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
                 fab.setImageResource(R.drawable.ic_baseline_close_24)
                 true
             }
-            setRecordStateJNI(isRecording)
+            vioEngine.setRecording(isRecording)
         }
 
         // Our start / stop openvins button
@@ -203,7 +172,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
                 trajectoryView?.clearTrajectory()
                 true
             }
-            toggleSystemJNI(isRunningOV)
+            vioEngine.toggleSystem(isRunningOV)
         }
 
     }
@@ -215,17 +184,48 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     ) {
         when (requestCode) {
             PERMISSION_REQUEST -> {
-                if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                val cameraGranted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+                if (cameraGranted) {
                     mOpenCvCameraView!!.setCameraPermissionGranted()
                 } else {
                     Log.e(TAG, "Camera permission was not granted")
-                    Toast.makeText(this, "Camera permission was not granted", Toast.LENGTH_LONG)
-                        .show()
+                    Toast.makeText(this, "Camera permission was not granted", Toast.LENGTH_LONG).show()
                 }
+                // 权限授予后（无论存储权限是否获得）执行初始化
+                // Android 10+ 访问 getExternalFilesDir 不需要存储权限
+                initFoldersAndConfig()
             }
             else -> {
                 Log.e(TAG, "Unexpected permission request")
             }
+        }
+    }
+
+    /**
+     * 初始化录制目录与配置文件，需在存储权限确认后调用。
+     */
+    private fun initFoldersAndConfig() {
+        val appPrivateFolderRoot = filesDir.toString()
+        val appRecordFolder =
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+                .toString() + "/openvins/"
+
+        recordFolder = appRecordFolder
+        val file = File(recordFolder)
+        if ((!file.isDirectory && !file.mkdirs()) || file.isFile) {
+            Toast.makeText(
+                applicationContext,
+                "ERROR: unable to create directory. $recordFolder",
+                Toast.LENGTH_LONG
+            ).show()
+        } else {
+            hasRecordFolder = true
+            // 从 assets 解压配置文件到私有目录（仅首次）
+            vioEngine.copyConfigIfNeeded(this)
+            // 设置录制目录（公共，用户可访问）
+            vioEngine.setRecordFolder(recordFolder)
+            // 设置私有目录根路径（原生层会在其下查找 /config/ 子目录）
+            vioEngine.setPrivateFolder(appPrivateFolderRoot)
         }
     }
 
@@ -271,12 +271,12 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         
         // Stop OpenVINS system and clean up native resources
         if (isRunningOV) {
-            toggleSystemJNI(false)
+            vioEngine.toggleSystem(false)
         }
         
         // Stop recording if active
         if (isRecording) {
-            setRecordStateJNI(false)
+            vioEngine.setRecording(false)
         }
         
         // Disable camera view
@@ -288,7 +288,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     override fun onFrame(matAddr: Long, timestampSec: Double) {
         // Native function processes the frame and updates it in-place
         // Mat address is already from native code, so we can use it directly
-        processImageJNI(matAddr, timestampSec)
+        vioEngine.processImage(matAddr, timestampSec)
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
@@ -312,7 +312,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
             // Use the sensor event timestamp (nanoseconds since boot, converted to seconds)
             // This ensures consistent timing with camera timestamps which also use boot time reference
             val timestampSec = (event!!.timestamp * 1e-9).toDouble()
-            processInertialJNI(
+            vioEngine.processImu(
                 eventAccel!!.values[0], eventAccel!!.values[1], eventAccel!!.values[2],
                 eventGyro!!.values[0], eventGyro!!.values[1], eventGyro!!.values[2],
                 timestampSec
@@ -327,40 +327,22 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         Log.d(TAG, "[sensor]: accuracy level of ${p0.toString()} changed to $p1")
     }
 
-    private external fun setAppRecordFolderJNI(dir: String)
-    private external fun setAppPrivateFolderJNI(dir: String)
-    private external fun setRecordStateJNI(state: Boolean)
-    private external fun toggleSystemJNI(state: Boolean)
-    private external fun processImageJNI(matAddr: Long, timestampSec: Double)
-    private external fun processInertialJNI(
-        ax: Float, ay: Float, az: Float,
-        gx: Float, gy: Float, gz: Float,
-        timestampSec: Double
-    )
-    private external fun getCurrentPoseJNI(position: DoubleArray, quaternion: DoubleArray): Boolean
-    // Combined function: returns number of points copied (0 on error/empty)
-    // Arrays must be pre-allocated with sufficient size (max_size * 3 for positions, max_size * 4 for quaternions)
-    private external fun getTrajectoryDataJNI(positions: DoubleArray, quaternions: DoubleArray): Int
-    
     private fun updateTrajectoryView() {
         if (trajectoryView == null) return
         
         // Get current pose
         val currentPos = DoubleArray(3)
         val currentQuat = DoubleArray(4)
-        if (!getCurrentPoseJNI(currentPos, currentQuat)) {
+        if (!vioEngine.getCurrentPose(currentPos, currentQuat)) {
             return // System not initialized
         }
         
         // Allocate arrays with maximum expected size (MAX_TRAJECTORY_POINTS = 10000)
-        // The native function will return the actual number of points copied
         val maxSize = 10000
         val positions = DoubleArray(maxSize * 3)
         val quaternions = DoubleArray(maxSize * 4)
         
-        // Get trajectory data atomically (size and data in one call)
-        // This prevents race conditions where size could change between separate calls
-        val trajectorySize = getTrajectoryDataJNI(positions, quaternions)
+        val trajectorySize = vioEngine.getTrajectoryData(positions, quaternions)
         
         if (trajectorySize == 0) {
             // Empty trajectory or error
@@ -394,9 +376,5 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     companion object {
         private const val TAG = "MainActivity"
         private const val PERMISSION_REQUEST = 1
-    }
-
-    init {
-        Log.i(TAG, "Instantiated new " + this.javaClass)
     }
 }

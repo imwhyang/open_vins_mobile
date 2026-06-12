@@ -9,6 +9,7 @@ println "Eigen3: " +eigen3VersionName + " " + project.buildscript.sourceFile
 android {
     namespace "com.thirdparty.eigen3"
     compileSdk 30
+//    ndkVersion "21.0.6113669"
 
     defaultConfig {
         minSdkVersion 21

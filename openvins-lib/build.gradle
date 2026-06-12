@@ -1,0 +1,83 @@
+plugins {
+    id 'com.android.library'
+    id 'kotlin-android'
+    id 'maven-publish'
+}
+
+android {
+    namespace "com.openvins.android"
+    compileSdk 30
+//    ndkVersion "21.0.6113669"
+
+    defaultConfig {
+        minSdkVersion 21
+        targetSdkVersion 30
+        versionCode 1
+        versionName "1.0.0"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++11 -frtti -fexceptions"
+                abiFilters 'arm64-v8a'
+                arguments "-DOpenCV_DIR=" + project(':thirdparty:opencv').projectDir.absolutePath + "/native",
+                        "-DBOOST_DIR=" + project(':thirdparty:boost').projectDir.absolutePath,
+                        "-DEIGEN3_DIR=" + project(':thirdparty:eigen3').projectDir.absolutePath,
+                        "-DANDROID_ARM_NEON=ON"
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+}
+
+dependencies {
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
+    implementation 'androidx.core:core-ktx:1.2.0'
+    implementation 'androidx.appcompat:appcompat:1.1.0'
+    // OpenCV 本地子模块依赖，编译和运行时均需要；
+    // 在 POM 发布时会被手动移除，消费方不需单独添加
+    implementation project(':thirdparty:opencv')
+}
+
+// Maven Publish 配置，供 JitPack 使用
+afterEvaluate {
+    publishing {
+        publications {
+            release(MavenPublication) {
+                from components.release
+                groupId = 'com.github.openvins'
+                artifactId = 'openvins-lib'
+                version = '1.0.0'
+
+                // 移除本地子模块依赖，防止消费方编译失败
+                pom.withXml {
+                    def depsNode = asNode().get('dependencies')
+                    if (depsNode && depsNode.size() > 0) {
+                        def toRemove = depsNode[0].children().findAll { node ->
+                            node.get('groupId').text().startsWith('open_vins_android')
+                        }
+                        toRemove.each { depsNode[0].remove(it) }
+                    }
+                }
+            }
+        }
+    }
+}
