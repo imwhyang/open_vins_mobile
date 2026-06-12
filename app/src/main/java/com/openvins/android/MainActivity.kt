@@ -202,6 +202,21 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
                     }
 
             }
+
+            val toggleTrajectory = findViewById(R.id.toggle_trajectory) as FloatingActionButton
+            toggleTrajectory.setOnClickListener {
+                val timestamp = System.currentTimeMillis() / 1000
+                val externalStoragePublicDirectory =
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+                        .toString() + "/openvins/trajectory/"
+
+                trajectoryView?.captureImage(externalStoragePublicDirectory + "/${timestamp}.jpg") { file ->
+                    if (file != null) {
+                        Log.i("TAG", "轨迹图已保存: ${file.absolutePath}")
+                    }else
+                        Log.i("TAG", "轨迹图保存失败")
+                }
+            }
         }
 
     }
