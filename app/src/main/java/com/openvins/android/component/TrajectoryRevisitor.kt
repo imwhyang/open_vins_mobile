@@ -24,10 +24,9 @@ class TrajectoryRevisitor {
         translation: DoubleArray,
         quaternion: DoubleArray,
     ): Boolean {
-        var trajectory = (
-                Trajectory.create(translations, quaternions, order = "xyzs") +
-                        Pose.create(translation, quaternion, order = "xyzs")
-                )
+        var trajectory =
+            Trajectory.create(translations, quaternions) + Pose.create(translation, quaternion)
+
         var outerTrajectory = buildOuterTrajectory(trajectory)
         trajectory = smoothTrajectory(trajectory)
         outerTrajectory = smoothTrajectory(outerTrajectory)
