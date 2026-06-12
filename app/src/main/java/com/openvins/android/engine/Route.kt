@@ -83,10 +83,10 @@ object Route {
 
         // Calculate distances between consecutive points in the trajectory (only x, y dimensions)
         val distances = DoubleArray(n) { i ->
-            if (i == 0) 0.0 else Utils.distance2PointToPoint(path[i - 1], path[i])
+            if (i == 0) 0.0 else Utils.distancePointToPoint(path[i - 1], path[i])
         }
 
-        // Compute cumulative sum of distances
+        // cumsum[i] = distance from path[0] to path[i]
         val cumsum = DoubleArray(n)
         cumsum[0] = distances[0]
         for (i in 1 until n) {
@@ -94,11 +94,13 @@ object Route {
         }
 
         // Reverse the cumulative sum and adjust it relative to the start index
+        val total = cumsum.last()
         val reversedCumsum = DoubleArray(n) { i ->
-            cumsum.last() - cumsum[n - i - 1]
+            total - cumsum[n - i - 1]
         }
+        val tmp = reversedCumsum[start]
         for (i in reversedCumsum.indices) {
-            reversedCumsum[i] -= reversedCumsum[start]
+            reversedCumsum[i] -= tmp
         }
 
         // Find the end index where the cumulative mileage is less than or equal to the given mileage
@@ -106,7 +108,8 @@ object Route {
 
         // Find the end distance index where the cumulative mileage is less than or equal to mileage + maxDistance
         val endDistance =
-            reversedCumsum.indexOfFirst { it > mileage + maxDistance }.takeIf { it != -1 } ?: n
+            reversedCumsum.indexOfFirst { it > mileage + maxDistance }.takeIf { it != -1 }
+                ?: (n - 1)
 
         // Return the sub-path and the adjusted end distance index
         return Triple(n - end - 1, n - start, n - endDistance - 1)
