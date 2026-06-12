@@ -12,6 +12,10 @@ import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.Image
 import android.media.ImageReader
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaFormat
+import android.media.MediaMuxer
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.AttributeSet
@@ -23,6 +27,8 @@ import android.view.SurfaceView
 import org.opencv.android.Utils
 import org.opencv.core.Mat
 import org.opencv.imgproc.Imgproc
+import java.io.File
+import java.nio.ByteBuffer
 
 interface CameraFrameListener {
     fun onFrame(matAddr: Long, timestampSec: Double)
@@ -53,6 +59,18 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
     private var mFrameListener: CameraFrameListener? = null
     private var mEnabled = false
     private var mCameraPermissionGranted = false
+
+    // ---- 视频录制相关 ----
+    private var mMediaCodec: MediaCodec? = null
+    private var mMediaMuxer: MediaMuxer? = null
+    @Volatile
+    private var mIsRecording = false
+    private var mMuxerStarted = false
+    private var mVideoTrackIndex = -1
+    private var mRecordingStartTimeNs: Long = 0L
+    private var mRecordingFilePath: String? = null
+    // 录制锁，保护编码器并发访问
+    private val mRecordingLock = Object()
     
     // Temporary display bitmap
     private var mDisplayBitmap: Bitmap? = null
@@ -122,6 +140,11 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
 
     private fun disconnectCamera() {
         Log.i(TAG, "disconnectCamera")
+        // 断开相机前，若正在录制则自动停止
+        if (mIsRecording) {
+            Log.i(TAG, "Auto-stopping recording due to camera disconnect")
+            stopRecording()
+        }
         val handler = mBackgroundHandler
         
         // Close capture session first
@@ -384,6 +407,21 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
                     }
                 }
                 
+                // ---- 录制：在 VIO 处理之后、image.close() 之前，将帧送入编码器 ----
+                if (mIsRecording) {
+                    synchronized(mRecordingLock) {
+                        if (mIsRecording && yBytes.isNotEmpty()) {
+                            feedFrameToEncoder(
+                                yBytes, uBytes, vBytes,
+                                imgWidth, imgHeight,
+                                yStride, uStride, vStride,
+                                uPixelStride,
+                                frameTimestampNs
+                            )
+                        }
+                    }
+                }
+
                 image.close()
             }, mBackgroundHandler)
             
@@ -517,6 +555,233 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
                 canvas.drawBitmap(bitmap, null, android.graphics.RectF(left, top, left + scaledWidth, top + scaledHeight), null)
             } finally {
                 holder.unlockCanvasAndPost(canvas)
+            }
+        }
+    }
+
+    // ---- 视频录制公开接口 ----
+
+    /**
+     * 开始录制视频快照。
+     * @param filePath 输出 MP4 文件路径（建议使用 getExternalFilesDir 或 getFilesDir 下的子目录）
+     * @param bitrate  编码码率，默认 1Mbps（低码率节省空间）
+     * @return true 表示成功启动录制
+     */
+    @JvmOverloads
+    fun startRecording(filePath: String, bitrate: Int = 1_000_000): Boolean {
+        synchronized(mRecordingLock) {
+            if (mIsRecording) {
+                Log.w(TAG, "Already recording")
+                return false
+            }
+            if (mPreviewSize.width <= 0 || mPreviewSize.height <= 0) {
+                Log.e(TAG, "Cannot start recording: preview size not set")
+                return false
+            }
+            try {
+                val width = mPreviewSize.width
+                val height = mPreviewSize.height
+                // 确保宽高为偶数（H.264 要求）
+                val encWidth = width and 0x7FFFFFFE
+                val encHeight = height and 0x7FFFFFFE
+
+                val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, encWidth, encHeight)
+                format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+                format.setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+                format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+                format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar)
+
+                val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                codec.start()
+
+                // 确保输出目录存在
+                val outFile = File(filePath)
+                outFile.parentFile?.mkdirs()
+
+                val muxer = MediaMuxer(filePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+
+                mMediaCodec = codec
+                mMediaMuxer = muxer
+                mMuxerStarted = false
+                mVideoTrackIndex = -1
+                mRecordingStartTimeNs = System.nanoTime()
+                mRecordingFilePath = filePath
+                mIsRecording = true
+
+                Log.i(TAG, "Recording started: $filePath (${encWidth}x${encHeight}, ${bitrate / 1000}kbps)")
+                return true
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start recording", e)
+                releaseRecorder()
+                return false
+            }
+        }
+    }
+
+    /**
+     * 停止录制并释放编码器资源。
+     * @return 输出文件路径，若失败返回 null
+     */
+    fun stopRecording(): String? {
+        synchronized(mRecordingLock) {
+            if (!mIsRecording) {
+                Log.w(TAG, "Not recording")
+                return null
+            }
+            mIsRecording = false
+
+            try {
+                // 发送结束信号
+                mMediaCodec?.let { codec ->
+                    val bufIndex = codec.dequeueInputBuffer(5000)
+                    if (bufIndex >= 0) {
+                        codec.queueInputBuffer(bufIndex, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                    }
+                    drainEncoder(true)
+                }
+                Log.i(TAG, "Recording stopped")
+            } catch (e: Exception) {
+                Log.e(TAG, "Error stopping recording", e)
+            }
+
+            val outputPath = mRecordingFilePath
+            mRecordingFilePath = null
+
+            releaseRecorder()
+            return outputPath
+        }
+    }
+
+    /** 当前是否正在录制 */
+    fun isRecording(): Boolean = mIsRecording
+
+    /** 释放编码器和复用器资源（内部使用） */
+    private fun releaseRecorder() {
+        try {
+            mMediaCodec?.stop()
+        } catch (_: Exception) {}
+        try {
+            mMediaCodec?.release()
+        } catch (_: Exception) {}
+        try {
+            if (mMuxerStarted) {
+                mMediaMuxer?.stop()
+            }
+            mMediaMuxer?.release()
+        } catch (_: Exception) {}
+        mMediaCodec = null
+        mMediaMuxer = null
+        mMuxerStarted = false
+        mVideoTrackIndex = -1
+    }
+
+    /**
+     * 将 YUV_420_888 帧送入编码器（在 mRecordingLock 保护下调用）。
+     * 仅在 mIsRecording == true 时被调用。
+     */
+    private fun feedFrameToEncoder(
+        yBytes: ByteArray, uBytes: ByteArray?, vBytes: ByteArray?,
+        width: Int, height: Int,
+        yStride: Int, uStride: Int, vStride: Int,
+        uPixelStride: Int,
+        timestampNs: Long
+    ) {
+        val codec = mMediaCodec ?: return
+        // 确保宽高为偶数
+        val encWidth = width and 0x7FFFFFFE
+        val encHeight = height and 0x7FFFFFFE
+        val frameSize = encWidth * encHeight
+
+        // 构造 NV12（YUV420SP）：Y 平面 + 交织 UV 平面
+        val nv12 = ByteArray(frameSize * 3 / 2)
+
+        // 拷贝 Y 平面（处理 stride）
+        if (yStride == encWidth) {
+            System.arraycopy(yBytes, 0, nv12, 0, frameSize)
+        } else {
+            for (row in 0 until encHeight) {
+                System.arraycopy(yBytes, row * yStride, nv12, row * encWidth, encWidth)
+            }
+        }
+
+        // 拷贝 UV 交织平面（NV12: U0 V0 U1 V1 ...）
+        val uvOffset = frameSize
+        val uvRows = encHeight / 2
+        if (uPixelStride == 2 && uBytes != null && uStride == encWidth) {
+            // 已经是 NV12 布局，直接拷贝
+            val uvSize = frameSize / 2
+            System.arraycopy(uBytes, 0, nv12, uvOffset, minOf(uvSize, uBytes.size))
+        } else if (uBytes != null && vBytes != null) {
+            // 逐像素交织 U/V
+            var uvPos = 0
+            for (row in 0 until uvRows) {
+                for (col in 0 until encWidth / 2) {
+                    val uIdx = row * uStride + col * uPixelStride
+                    val vIdx = row * vStride + col * uPixelStride  // V 与 U 有相同 pixelStride
+                    if (uIdx < uBytes.size && vIdx < vBytes.size && uvPos + 1 < nv12.size - uvOffset) {
+                        nv12[uvOffset + uvPos] = uBytes[uIdx]
+                        nv12[uvOffset + uvPos + 1] = vBytes[vIdx]
+                        uvPos += 2
+                    }
+                }
+            }
+        }
+
+        try {
+            val bufIndex = codec.dequeueInputBuffer(0)
+            if (bufIndex < 0) return  // 编码器忙，跳过此帧
+
+            val inputBuffer = codec.getInputBuffer(bufIndex) ?: return
+            inputBuffer.clear()
+            inputBuffer.put(nv12)
+
+            // 计算相对时间戳（微秒），相对于录制起始时间
+            val presentationTimeUs = (timestampNs - mRecordingStartTimeNs) / 1000  // ns -> us
+
+            codec.queueInputBuffer(bufIndex, 0, nv12.size, presentationTimeUs, 0)
+            drainEncoder(false)
+        } catch (e: MediaCodec.CodecException) {
+            if (!e.isRecoverable) {
+                Log.e(TAG, "Encoder fatal error, stopping recording", e)
+                mIsRecording = false
+                releaseRecorder()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error feeding frame to encoder", e)
+        }
+    }
+
+    /** 从编码器输出端取出编码数据并写入 Muxer */
+    private fun drainEncoder(endOfStream: Boolean) {
+        val codec = mMediaCodec ?: return
+        val muxer = mMediaMuxer ?: return
+        val bufferInfo = MediaCodec.BufferInfo()
+
+        while (true) {
+            val outputIndex = codec.dequeueOutputBuffer(bufferInfo, if (endOfStream) 10000 else 0)
+            when {
+                outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                    if (!endOfStream) return
+                }
+                outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                    val newFormat = codec.outputFormat
+                    mVideoTrackIndex = muxer.addTrack(newFormat)
+                    muxer.start()
+                    mMuxerStarted = true
+                }
+                outputIndex >= 0 -> {
+                    val outputBuffer = codec.getOutputBuffer(outputIndex)
+                    if (outputBuffer != null && bufferInfo.size > 0 && mMuxerStarted) {
+                        outputBuffer.position(bufferInfo.offset)
+                        outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
+                        muxer.writeSampleData(mVideoTrackIndex, outputBuffer, bufferInfo)
+                    }
+                    codec.releaseOutputBuffer(outputIndex, false)
+                    if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                        return
+                    }
+                }
             }
         }
     }
