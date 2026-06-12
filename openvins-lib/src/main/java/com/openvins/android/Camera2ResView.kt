@@ -67,8 +67,9 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
     private var mIsRecording = false
     private var mMuxerStarted = false
     private var mVideoTrackIndex = -1
-    private var mRecordingStartTimeNs: Long = 0L
+    private var mRecordingStartTimeNs: Long = -1L  // -1 表示尚未收到首帧，首帧 timestamp 作为基准
     private var mRecordingFilePath: String? = null
+    private var mEncodedFrameCount: Int = 0  // 录制期间编码的帧数
     // 录制锁，保护编码器并发访问
     private val mRecordingLock = Object()
     
@@ -344,6 +345,20 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
                 )
                 
                 if (rgbaMatAddr == 0L) {
+                    // VIO 未初始化时仍录制原始相机帧，不跳过
+                    if (mIsRecording) {
+                        synchronized(mRecordingLock) {
+                            if (mIsRecording) {
+                                feedFrameToEncoder(
+                                    yBytes, uBytes, vBytes,
+                                    imgWidth, imgHeight,
+                                    yStride, uStride, vStride,
+                                    uPixelStride,
+                                    frameTimestampNs
+                                )
+                            }
+                        }
+                    }
                     image.close()
                     return@setOnImageAvailableListener
                 }
@@ -605,7 +620,8 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
                 mMediaMuxer = muxer
                 mMuxerStarted = false
                 mVideoTrackIndex = -1
-                mRecordingStartTimeNs = System.nanoTime()
+                mRecordingStartTimeNs = -1L  // 等待首帧 timestamp 作为基准
+                mEncodedFrameCount = 0
                 mRecordingFilePath = filePath
                 mIsRecording = true
 
@@ -632,11 +648,20 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
             mIsRecording = false
 
             try {
-                // 发送结束信号
+                // 发送结束信号（EOS）
                 mMediaCodec?.let { codec ->
-                    val bufIndex = codec.dequeueInputBuffer(5000)
-                    if (bufIndex >= 0) {
-                        codec.queueInputBuffer(bufIndex, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                    // 循环等待直到拿到输入 buffer，确保 EOS 信号一定发出
+                    var sent = false
+                    for (attempt in 0 until 10) {
+                        val bufIndex = codec.dequeueInputBuffer(10_000)  // 每次等 10ms
+                        if (bufIndex >= 0) {
+                            codec.queueInputBuffer(bufIndex, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            sent = true
+                            break
+                        }
+                    }
+                    if (!sent) {
+                        Log.w(TAG, "Failed to send EOS after retries, forcing drain")
                     }
                     drainEncoder(true)
                 }
@@ -729,22 +754,42 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
         }
 
         try {
-            val bufIndex = codec.dequeueInputBuffer(0)
-            if (bufIndex < 0) return  // 编码器忙，跳过此帧
+            val bufIndex = codec.dequeueInputBuffer(10_000)  // 10ms 超时，等待编码器就绪
+            if (bufIndex < 0) {
+                Log.w(TAG, "Encoder input buffer not available, skipping frame")
+                return  // 编码器忙，跳过此帧
+            }
 
             val inputBuffer = codec.getInputBuffer(bufIndex) ?: return
+            val capacity = inputBuffer.capacity()
             inputBuffer.clear()
             inputBuffer.put(nv12)
+            // 填充剩余空间为零，确保缓冲区完全填满（某些硬件编码器要求）
+            val remaining = capacity - nv12.size
+            if (remaining > 0) {
+                inputBuffer.put(ByteArray(remaining))
+            }
 
-            // 计算相对时间戳（微秒），相对于录制起始时间
+            // 使用首帧的 image.timestamp（CLOCK_BOOTTIME）作为基准，避免时钟不匹配
+            if (mRecordingStartTimeNs < 0) {
+                mRecordingStartTimeNs = timestampNs
+                Log.i(TAG, "First recording frame timestamp: ${timestampNs}ns")
+            }
+            // 计算相对时间戳（微秒），相对于录制首帧时间
             val presentationTimeUs = (timestampNs - mRecordingStartTimeNs) / 1000  // ns -> us
 
-            codec.queueInputBuffer(bufIndex, 0, nv12.size, presentationTimeUs, 0)
+            // 报告完整缓冲区大小（含零填充），确保编码器能正确处理
+            codec.queueInputBuffer(bufIndex, 0, capacity, presentationTimeUs, 0)
+            mEncodedFrameCount++
+            if (mEncodedFrameCount % 30 == 1) {
+                Log.d(TAG, "Recording frame #$mEncodedFrameCount, pts=${presentationTimeUs}us, muxerStarted=$mMuxerStarted")
+            }
             drainEncoder(false)
         } catch (e: MediaCodec.CodecException) {
             if (!e.isRecoverable) {
                 Log.e(TAG, "Encoder fatal error, stopping recording", e)
-                mIsRecording = false
+                // 注意：此处不重置 mIsRecording，由 stopRecording() 统一处理
+                // 仅释放编码器资源，保留 mRecordingFilePath 以便 stopRecording 返回路径
                 releaseRecorder()
             }
         } catch (e: Exception) {
@@ -757,18 +802,28 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
         val codec = mMediaCodec ?: return
         val muxer = mMediaMuxer ?: return
         val bufferInfo = MediaCodec.BufferInfo()
+        // 保护计数器，防止无限循环（某些编码器可能不产生输出）
+        var maxIterations = if (endOfStream) 100 else 10
 
-        while (true) {
+        while (maxIterations-- > 0) {
             val outputIndex = codec.dequeueOutputBuffer(bufferInfo, if (endOfStream) 10000 else 0)
             when {
                 outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
                     if (!endOfStream) return
+                    // EOS 模式下继续等待
                 }
                 outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    val newFormat = codec.outputFormat
-                    mVideoTrackIndex = muxer.addTrack(newFormat)
-                    muxer.start()
-                    mMuxerStarted = true
+                    if (!mMuxerStarted) {
+                        val newFormat = codec.outputFormat
+                        Log.i(TAG, "Encoder output format changed: $newFormat")
+                        mVideoTrackIndex = muxer.addTrack(newFormat)
+                        muxer.start()
+                        mMuxerStarted = true
+                    }
+                }
+                outputIndex == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> {
+                    // 编码器内部缓冲区变更，继续循环即可
+                    Log.d(TAG, "Encoder output buffers changed")
                 }
                 outputIndex >= 0 -> {
                     val outputBuffer = codec.getOutputBuffer(outputIndex)
@@ -779,10 +834,14 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
                     }
                     codec.releaseOutputBuffer(outputIndex, false)
                     if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                        Log.i(TAG, "Encoder EOS received, total encoded frames: $mEncodedFrameCount")
                         return
                     }
                 }
             }
+        }
+        if (endOfStream) {
+            Log.w(TAG, "drainEncoder: max iterations reached without EOS, muxerStarted=$mMuxerStarted")
         }
     }
 

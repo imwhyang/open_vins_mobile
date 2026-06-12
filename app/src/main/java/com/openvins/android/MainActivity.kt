@@ -28,11 +28,13 @@ import com.google.android.material.floatingactionbutton.FloatingActionButton
 import java.io.File
 import android.os.Handler
 import android.os.Looper
+import android.widget.TextView
+import androidx.core.content.ContextCompat
 import com.openvins.android.component.TrajectoryRevisitor
 
 
 class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListener {
-
+    var tvPose: TextView? = null
     private var mOpenCvCameraView: Camera2ResView? = null
     private var isRecording: Boolean = false
     private var isRunningOV: Boolean = false
@@ -61,6 +63,8 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     init {
         Log.i(TAG, "Instantiated new " + this.javaClass)
     }
+
+
 
     public override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -181,6 +185,8 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
                 true
             }
             vioEngine.toggleSystem(isRunningOV)
+
+            tvPose = findViewById(R.id.tv_pose)
         }
 
     }
@@ -387,6 +393,14 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         val isRevisit = trajectoryRevisitor.searchRevisitTrajectory(
             positions, quaternions, currentPos, currentQuat
         )
+        tvPose?.text = String.format("Pose: currPosFloats: %f %f %f  isRevisit %b",currPosFloats[0],currPosFloats[1],currPosFloats[2],isRevisit)
+        if (isRevisit){
+            tvPose?.setTextColor(ContextCompat.getColor(this, R.color.red))
+        }else{
+            tvPose?.setTextColor(ContextCompat.getColor(this, R.color.white))
+        }
+
+
         // Update the 3D view
         trajectoryView?.updateTrajectory(posFloats, quatFloats, currPosFloats, currQuatFloats)
     }
