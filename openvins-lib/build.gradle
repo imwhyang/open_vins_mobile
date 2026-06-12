@@ -53,6 +53,8 @@ dependencies {
     implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
     implementation 'androidx.core:core-ktx:1.2.0'
     implementation 'androidx.appcompat:appcompat:1.1.0'
+    // OpenCV 本地子模块依赖，编译和运行时均需要；
+    // 在 POM 发布时会被手动移除，消费方不需单独添加
     implementation project(':thirdparty:opencv')
 }
 
@@ -65,6 +67,18 @@ afterEvaluate {
                 groupId = 'com.github.openvins'
                 artifactId = 'openvins-lib'
                 version = '1.0.0'
+
+                // 移除本地子模块依赖，防止消费方编译失败
+                pom.withXml {
+                    def deps = asNode().dependencies
+                    if (deps) {
+                        deps[0].children().removeAll { dep ->
+                            def groupId = dep.groupId?.text()
+                            // 移除所有 open_vins_android.thirdparty 开头的本地依赖
+                            groupId?.startsWith('open_vins_android.thirdparty')
+                        }
+                    }
+                }
             }
         }
     }
