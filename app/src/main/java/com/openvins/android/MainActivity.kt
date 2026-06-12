@@ -81,7 +81,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         setContentView(R.layout.activity_main)
         mOpenCvCameraView = findViewById<View>(R.id.test_view) as Camera2ResView
         mOpenCvCameraView!!.setCameraFrameListener(this)
-        
+
         // Setup trajectory view
         trajectoryView = findViewById<Trajectory3DView>(R.id.trajectory_view)
         // Force initial render to show axes and grid
@@ -165,11 +165,19 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         reset.setOnClickListener {
             isRunningOV = if (isRunningOV) {
                 reset.setImageResource(R.drawable.ic_baseline_play_arrow_24)
+//                时间戳
+                val timestamp = System.currentTimeMillis() / 1000
+                val externalStoragePublicDirectory =
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+                        .toString() + "/openvins/video/"
+                mOpenCvCameraView!!.startRecording(externalStoragePublicDirectory + "/${timestamp}.mp4")
                 false
             } else {
                 reset.setImageResource(R.drawable.ic_stop_system)
                 // Clear trajectory view when starting (in case there was leftover data)
                 trajectoryView?.clearTrajectory()
+                val stopRecording = mOpenCvCameraView!!.stopRecording()
+                Log.d(TAG, "Stopped recording: $stopRecording")
                 true
             }
             vioEngine.toggleSystem(isRunningOV)
@@ -184,17 +192,20 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     ) {
         when (requestCode) {
             PERMISSION_REQUEST -> {
-                val cameraGranted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+                val cameraGranted =
+                    grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
                 if (cameraGranted) {
                     mOpenCvCameraView!!.setCameraPermissionGranted()
                 } else {
                     Log.e(TAG, "Camera permission was not granted")
-                    Toast.makeText(this, "Camera permission was not granted", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, "Camera permission was not granted", Toast.LENGTH_LONG)
+                        .show()
                 }
                 // 权限授予后（无论存储权限是否获得）执行初始化
                 // Android 10+ 访问 getExternalFilesDir 不需要存储权限
                 initFoldersAndConfig()
             }
+
             else -> {
                 Log.e(TAG, "Unexpected permission request")
             }
@@ -240,7 +251,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         super.onResume()
         // Activate camera feed
         mOpenCvCameraView!!.enableView()
-        
+
         sensorAccel?.also { sensor ->
             sensorManager.registerListener(
                 this,
@@ -255,30 +266,35 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
                 SensorManager.SENSOR_DELAY_FASTEST
             )
         }
-        
+
         // Start trajectory updates
         trajectoryUpdateHandler.post(trajectoryUpdateRunnable)
     }
 
     public override fun onDestroy() {
         super.onDestroy()
-        
+        val stopRecording = mOpenCvCameraView!!.stopRecording()
+        if (stopRecording != null) {
+            Log.d(TAG, "Stopped recording: $stopRecording")
+        }
+
+
         // Stop trajectory updates
         trajectoryUpdateHandler.removeCallbacks(trajectoryUpdateRunnable)
-        
+
         // Unregister sensor listeners
         sensorManager.unregisterListener(this)
-        
+
         // Stop OpenVINS system and clean up native resources
         if (isRunningOV) {
             vioEngine.toggleSystem(false)
         }
-        
+
         // Stop recording if active
         if (isRecording) {
             vioEngine.setRecording(false)
         }
-        
+
         // Disable camera view
         if (mOpenCvCameraView != null) {
             mOpenCvCameraView!!.disableView()
@@ -299,6 +315,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
                 //Log.e(TAG, "[acc]: ${event.values[0]}, ${event.values[1]}, ${event.values[2]}")
                 eventAccel = event
             }
+
             Sensor.TYPE_GYROSCOPE -> {
                 //Log.e(TAG, "[gyro]: ${event.values[0]}, ${event.values[1]}, ${event.values[2]}")
                 eventGyro = event
@@ -329,29 +346,30 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
 
     private fun updateTrajectoryView() {
         if (trajectoryView == null) return
-        
+
         // Get current pose
         val currentPos = DoubleArray(3)
         val currentQuat = DoubleArray(4)
         if (!vioEngine.getCurrentPose(currentPos, currentQuat)) {
             return // System not initialized
         }
-        
+
         // Allocate arrays with maximum expected size (MAX_TRAJECTORY_POINTS = 10000)
         val maxSize = 10000
         val positions = DoubleArray(maxSize * 3)
         val quaternions = DoubleArray(maxSize * 4)
-        
+
         val trajectorySize = vioEngine.getTrajectoryData(positions, quaternions)
-        
+
         if (trajectorySize == 0) {
             // Empty trajectory or error
-            trajectoryView?.updateTrajectory(floatArrayOf(), floatArrayOf(), 
-                FloatArray(3) { currentPos[it].toFloat() }, 
+            trajectoryView?.updateTrajectory(
+                floatArrayOf(), floatArrayOf(),
+                FloatArray(3) { currentPos[it].toFloat() },
                 FloatArray(4) { currentQuat[it].toFloat() })
             return
         }
-        
+
         // Convert only the actual number of points to float arrays
         val posFloats = FloatArray(trajectorySize * 3)
         val quatFloats = FloatArray(trajectorySize * 4)
@@ -361,7 +379,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         for (i in 0 until trajectorySize * 4) {
             quatFloats[i] = quaternions[i].toFloat()
         }
-        
+
         val currPosFloats = FloatArray(3) { currentPos[it].toFloat() }
         val currQuatFloats = FloatArray(4) { currentQuat[it].toFloat() }
 
