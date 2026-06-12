@@ -453,7 +453,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_toggleSyst
   }
 }
 
-extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_Camera2ResView_processYUVToRGBAJNI(JNIEnv *env, jclass clazz, jbyteArray yData,
+extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_processYUVToRGBAJNI(JNIEnv *env, jclass clazz, jbyteArray yData,
                                                                                                 jbyteArray uData, jbyteArray vData,
                                                                                                 jint width, jint height, jint yStride,
                                                                                                 jint uStride, jint vStride,
@@ -589,7 +589,7 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_Camera2ResView_proc
 }
 
 // Get display image - returns raw camera if not running, or viz image with overlays if running
-extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_Camera2ResView_getDisplayImageJNI(JNIEnv *env, jclass clazz,
+extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_getDisplayImageJNI(JNIEnv *env, jclass clazz,
                                                                                                jlong rawCameraMatAddr) {
   // If not running, just return the raw camera image (converted to RGB)
   if (!is_running_ov || sys == nullptr) {
@@ -654,7 +654,7 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_Camera2ResView_getD
 }
 
 // Delete a Mat object that was allocated with new (to prevent memory leaks)
-extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_Camera2ResView_deleteMatJNI(JNIEnv *env, jclass clazz, jlong matAddr) {
+extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_deleteMatJNI(JNIEnv *env, jclass clazz, jlong matAddr) {
   if (matAddr != 0) {
     cv::Mat *mat = reinterpret_cast<cv::Mat *>(matAddr);
     delete mat;
