@@ -1,10 +1,15 @@
 package com.openvins.android
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.opengl.GLSurfaceView
 import android.opengl.GLES20
 import android.opengl.Matrix
+import android.os.Handler
+import android.os.Looper
 import android.view.MotionEvent
+import java.io.File
+import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -32,7 +37,7 @@ class Trajectory3DView : GLSurfaceView {
         // Use setZOrderOnTop to ensure we're above the camera view
         setZOrderOnTop(true)
         setBackgroundColor(android.graphics.Color.TRANSPARENT)
-        renderer = TrajectoryRenderer()
+        renderer = TrajectoryRenderer(this)
         setRenderer(renderer)
         renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
     }
@@ -76,12 +81,91 @@ class Trajectory3DView : GLSurfaceView {
         requestRender() // Update view immediately
         return true
     }
+
+    // ---- 轨迹图片捕获 ----
+    @Volatile
+    private var mPendingCapturePath: String? = null
+    @Volatile
+    private var mPendingCaptureQuality: Int = 90
+    private var mCaptureCallback: ((File?) -> Unit)? = null
+
+    /**
+     * 将当前 3D 轨迹视图保存为 JPEG 图片。
+     * 在下一帧渲染完成后从 OpenGL 帧缓冲区读取像素。
+     * @param filePath 输出 JPEG 文件路径
+     * @param quality  JPEG 压缩质量（0-100），默认 90
+     * @param callback 保存完成后的回调（UI 线程），参数为 File 或 null（失败时）
+     */
+    @JvmOverloads
+    fun captureImage(filePath: String, quality: Int = 90, callback: (File?) -> Unit) {
+        mPendingCapturePath = filePath
+        mPendingCaptureQuality = quality
+        mCaptureCallback = callback
+        requestRender()
+    }
+
+    /** 由 TrajectoryRenderer 在 onDrawFrame 末尾调用，执行像素读取 */
+    internal fun performCaptureIfPending(viewWidth: Int, viewHeight: Int) {
+        val path = mPendingCapturePath ?: return
+        val quality = mPendingCaptureQuality
+        val callback = mCaptureCallback
+        mPendingCapturePath = null
+        mCaptureCallback = null
+
+        try {
+            // 从 OpenGL 帧缓冲区读取像素（RGBA）
+            val pixelCount = viewWidth * viewHeight
+            val buffer = ByteBuffer.allocateDirect(pixelCount * 4).order(ByteOrder.nativeOrder())
+            GLES20.glReadPixels(0, 0, viewWidth, viewHeight, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buffer)
+            buffer.rewind()
+
+            // 创建 ARGB_8888 Bitmap
+            val bitmap = Bitmap.createBitmap(viewWidth, viewHeight, Bitmap.Config.ARGB_8888)
+            val pixels = IntArray(pixelCount)
+            for (y in 0 until viewHeight) {
+                for (x in 0 until viewWidth) {
+                    val r = buffer.get().toInt() and 0xFF
+                    val g = buffer.get().toInt() and 0xFF
+                    val b = buffer.get().toInt() and 0xFF
+                    val a = buffer.get().toInt() and 0xFF
+                    // OpenGL 原点在左下角，需要垂直翻转
+                    val flippedY = viewHeight - 1 - y
+                    pixels[flippedY * viewWidth + x] = (a shl 24) or (r shl 16) or (g shl 8) or b
+                }
+            }
+            bitmap.setPixels(pixels, 0, viewWidth, 0, 0, viewWidth, viewHeight)
+
+            // 用黑色背景合成（轨迹视图背景是透明的）
+            val composited = Bitmap.createBitmap(viewWidth, viewHeight, Bitmap.Config.ARGB_8888)
+            val canvas = android.graphics.Canvas(composited)
+            canvas.drawColor(android.graphics.Color.BLACK)
+            canvas.drawBitmap(bitmap, 0f, 0f, null)
+            bitmap.recycle()
+
+            // 保存为 JPEG
+            val outFile = File(path)
+            outFile.parentFile?.mkdirs()
+            FileOutputStream(outFile).use { fos ->
+                composited.compress(Bitmap.CompressFormat.JPEG, quality, fos)
+            }
+            composited.recycle()
+
+            android.util.Log.i("Trajectory3D", "Trajectory image saved: $path (${viewWidth}x${viewHeight})")
+            Handler(Looper.getMainLooper()).post { callback?.invoke(outFile) }
+        } catch (e: Exception) {
+            android.util.Log.e("Trajectory3D", "Failed to capture trajectory image", e)
+            Handler(Looper.getMainLooper()).post { callback?.invoke(null) }
+        }
+    }
 }
 
-class TrajectoryRenderer : GLSurfaceView.Renderer {
+class TrajectoryRenderer(private val view: Trajectory3DView) : GLSurfaceView.Renderer {
     
     // Frame counter for logging
     private var frameCount = 0
+    // 视口尺寸（onSurfaceChanged 时更新）
+    private var viewportWidth = 0
+    private var viewportHeight = 0
     
     // Trajectory data
     private var trajectoryPositions: FloatArray = floatArrayOf()
@@ -182,6 +266,8 @@ class TrajectoryRenderer : GLSurfaceView.Renderer {
     
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
         GLES20.glViewport(0, 0, width, height)
+        viewportWidth = width
+        viewportHeight = height
         // Calculate aspect ratio of the screen
         screenAspectRatio = width.toFloat() / height.toFloat()
         // Store base orthographic size (will be scaled by zoom in onDrawFrame)
@@ -312,6 +398,9 @@ class TrajectoryRenderer : GLSurfaceView.Renderer {
             drawTrajectory()
             drawCameraFrustum()
         }
+
+        // 渲染完成后检查是否有待执行的图片捕获
+        view.performCaptureIfPending(viewportWidth, viewportHeight)
     }
     
     private fun drawTrajectory() {

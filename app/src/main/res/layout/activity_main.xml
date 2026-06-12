@@ -50,6 +50,29 @@
         android:scaleType="center"
         android:src="@drawable/ic_baseline_play_arrow_24"
         android:tint="@color/black" />
+<!--    拍照-->
+    <com.google.android.material.floatingactionbutton.FloatingActionButton
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="end|bottom"
+        android:layout_marginLeft="10dp"
+        android:layout_marginTop="230dp"
+        android:scaleType="center"
+        android:src="@android:drawable/ic_menu_camera"
+        android:id="@+id/take_photo"
+        android:tint="@color/black" />
+<!--    轨迹按钮-->
+    <com.google.android.material.floatingactionbutton.FloatingActionButton
+        android:id="@+id/toggle_trajectory"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="end|bottom"
+        android:layout_marginLeft="10dp"
+        android:layout_marginTop="300dp"
+        android:scaleType="center"
+        android:src="@android:drawable/ic_dialog_map"
+        android:tint="@color/black" />
+
 <!--    点位展示-->
     <TextView
         android:layout_alignParentBottom="true"

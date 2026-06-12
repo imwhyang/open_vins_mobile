@@ -65,7 +65,6 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     }
 
 
-
     public override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -187,6 +186,37 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
             vioEngine.toggleSystem(isRunningOV)
 
             tvPose = findViewById(R.id.tv_pose)
+            val takePicButton = findViewById(R.id.take_photo) as FloatingActionButton
+            takePicButton.setOnClickListener {
+                val timestamp = System.currentTimeMillis() / 1000
+                val externalStoragePublicDirectory =
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+                        .toString() + "/openvins/pointPic/"
+                    mOpenCvCameraView!!.captureRawImage(externalStoragePublicDirectory + "/${timestamp}.jpg") { file ->
+                        if (file != null) {
+                            Toast.makeText(this, "Capture Success", Toast.LENGTH_LONG).show()
+                            Log.d(TAG, "Capture Success" + file.absolutePath)
+                        } else {
+                            Toast.makeText(this, "Capture Failed", Toast.LENGTH_LONG).show()
+                        }
+                    }
+
+            }
+
+            val toggleTrajectory = findViewById(R.id.toggle_trajectory) as FloatingActionButton
+            toggleTrajectory.setOnClickListener {
+                val timestamp = System.currentTimeMillis() / 1000
+                val externalStoragePublicDirectory =
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+                        .toString() + "/openvins/trajectory/"
+
+                trajectoryView?.captureImage(externalStoragePublicDirectory + "/${timestamp}.jpg") { file ->
+                    if (file != null) {
+                        Log.i("TAG", "轨迹图已保存: ${file.absolutePath}")
+                    }else
+                        Log.i("TAG", "轨迹图保存失败")
+                }
+            }
         }
 
     }
@@ -393,10 +423,16 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         val result = trajectoryRevisitor.searchRevisitTrajectory(
             posFloats, quatFloats, currentPos, currentQuat
         )
-        tvPose?.text = String.format("Pose: currPosFloats: %f %f %f  isRevisit %b",currPosFloats[0],currPosFloats[1],currPosFloats[2],result.isRevisit)
-        if (result.isRevisit){
+        tvPose?.text = String.format(
+            "Pose: currPosFloats: %f %f %f  isRevisit %b",
+            currPosFloats[0],
+            currPosFloats[1],
+            currPosFloats[2],
+            result.isRevisit
+        )
+        if (result.isRevisit) {
             tvPose?.setTextColor(ContextCompat.getColor(this, R.color.red))
-        }else{
+        } else {
             tvPose?.setTextColor(ContextCompat.getColor(this, R.color.white))
         }
 

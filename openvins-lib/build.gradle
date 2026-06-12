@@ -13,7 +13,7 @@ android {
         minSdkVersion 21
         targetSdkVersion 30
         versionCode 1
-        versionName "1.0.0"
+        versionName "1.0.8"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild {
@@ -35,13 +35,6 @@ android {
         }
     }
 
-    // 打包 AAR 时排除 opencv 的 .so 文件，避免消费方出现 so 重复冲突
-    packagingOptions {
-        exclude 'lib/arm64-v8a/libopencv_java4.so'
-        exclude 'lib/armeabi-v7a/libopencv_java4.so'
-        exclude 'lib/x86/libopencv_java4.so'
-        exclude 'lib/x86_64/libopencv_java4.so'
-    }
     externalNativeBuild {
         cmake {
             path "src/main/cpp/CMakeLists.txt"
@@ -73,7 +66,7 @@ afterEvaluate {
                 from components.release
                 groupId = 'com.github.openvins'
                 artifactId = 'openvins-lib'
-                version = '1.0.0'
+                version = '1.0.8'
 
                 // 移除本地子模块依赖，防止消费方编译失败
                 pom.withXml {
