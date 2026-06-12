@@ -136,6 +136,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
             ).show()
         } else {
             hasRecordFolder = true
+            vioEngine.copyConfigIfNeeded(this)
             // Set recording directory (public, for user access)
             vioEngine.setRecordFolder(recordFolder)
             // Set private folder root (native code will add /config/ subdirectory)

@@ -1,6 +1,9 @@
 package com.openvins.android
 
+import android.content.Context
 import android.util.Log
+import java.io.File
+import java.io.FileOutputStream
 
 /**
  * OpenVINS 视觉惯性导航引擎的统一公开 API。
@@ -14,6 +17,39 @@ class VioEngine {
         init {
             System.loadLibrary("native-lib")
         }
+    }
+
+    /**
+     * 将 assets/config/ 中的配置文件解压到应用私有目录，仅当目标文件不存在时执行。
+     * 应在 setPrivateFolder() 之前调用。
+     * @param context 应用 Context，用于访问 assets 和私有存储
+     * @return 配置文件所在目录路径（即 externalFilesDir/config/）
+     */
+    fun copyConfigIfNeeded(context: Context): String {
+        val configDir = File(context.getExternalFilesDir(null), "config")
+        if (!configDir.exists()) configDir.mkdirs()
+
+        val assetFiles = listOf(
+            "estimator_config.yaml",
+            "kalibr_imu_chain.yaml",
+            "kalibr_imucam_chain.yaml"
+        )
+        for (fileName in assetFiles) {
+            val dest = File(configDir, fileName)
+            if (!dest.exists()) {
+                try {
+                    context.assets.open("config/$fileName").use { input ->
+                        FileOutputStream(dest).use { output ->
+                            input.copyTo(output)
+                        }
+                    }
+                    Log.i(TAG, "已从 assets 解压配置文件：$fileName")
+                } catch (e: Exception) {
+                    Log.e(TAG, "解压配置文件失败：$fileName", e)
+                }
+            }
+        }
+        return configDir.parent ?: ""
     }
 
     /**
