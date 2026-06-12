@@ -24,7 +24,6 @@ android {
                         "-DBOOST_DIR=" + project(':thirdparty:boost').projectDir.absolutePath,
                         "-DEIGEN3_DIR=" + project(':thirdparty:eigen3').projectDir.absolutePath,
                         "-DANDROID_ARM_NEON=ON"
-//                        "-DANDROID_STL=c++_shared"
             }
         }
     }
@@ -70,13 +69,12 @@ afterEvaluate {
 
                 // 移除本地子模块依赖，防止消费方编译失败
                 pom.withXml {
-                    def deps = asNode().dependencies
-                    if (deps) {
-                        deps[0].children().removeAll { dep ->
-                            def groupId = dep.groupId?.text()
-                            // 移除所有 open_vins_android.thirdparty 开头的本地依赖
-                            groupId?.startsWith('open_vins_android.thirdparty')
+                    def depsNode = asNode().get('dependencies')
+                    if (depsNode && depsNode.size() > 0) {
+                        def toRemove = depsNode[0].children().findAll { node ->
+                            node.get('groupId').text().startsWith('open_vins_android')
                         }
+                        toRemove.each { depsNode[0].remove(it) }
                     }
                 }
             }
