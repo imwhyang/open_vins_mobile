@@ -851,7 +851,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIne
   // If recording save to disk
   if (is_recording && imu_csv.is_open()) {
     imu_csv << time_in_ns << "," << n_gx << "," << n_gy << "," << n_gz << "," << n_ax << "," << n_ay << "," << n_az << std::endl;
-    __android_log_print(ANDROID_LOG_INFO, TAG, "%.4f, %.4f, %.4f | %.4f, %.4f, %.4f \n", n_ax, n_ay, n_az, n_gx, n_gy, n_gz);
+//    __android_log_print(ANDROID_LOG_INFO, TAG, "%.4f, %.4f, %.4f | %.4f, %.4f, %.4f \n", n_ax, n_ay, n_az, n_gx, n_gy, n_gz);
   }
 
   // Feed if the system is running!
