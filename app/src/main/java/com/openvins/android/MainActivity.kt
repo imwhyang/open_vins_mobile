@@ -23,6 +23,7 @@ import com.google.android.material.floatingactionbutton.FloatingActionButton
 import java.io.File
 import android.os.Handler
 import android.os.Looper
+import com.openvins.android.component.TrajectoryRevisitor
 
 
 class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListener {
@@ -38,7 +39,9 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     private var sensorGyro: Sensor? = null
     private var eventAccel: SensorEvent? = null
     private var eventGyro: SensorEvent? = null
-    
+
+    private val trajectoryRevisitor: TrajectoryRevisitor = TrajectoryRevisitor()
+
     private var trajectoryView: Trajectory3DView? = null
     private val trajectoryUpdateHandler = Handler(Looper.getMainLooper())
     private val trajectoryUpdateRunnable = object : Runnable {
@@ -379,7 +382,11 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         
         val currPosFloats = FloatArray(3) { currentPos[it].toFloat() }
         val currQuatFloats = FloatArray(4) { currentQuat[it].toFloat() }
-        
+
+        // 判断路径重访状态
+        val isRevisit = trajectoryRevisitor.searchRevisitTrajectory(
+            positions, quaternions, currentPos, currentQuat
+        )
         // Update the 3D view
         trajectoryView?.updateTrajectory(posFloats, quatFloats, currPosFloats, currQuatFloats)
     }
