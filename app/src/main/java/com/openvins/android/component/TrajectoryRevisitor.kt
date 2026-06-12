@@ -55,7 +55,7 @@ class TrajectoryRevisitor {
         if (tripleRange1.first < 0 || tripleRange1.third < 0) {
             return false
         }
-        val queryOuterTrajectory = trajectory.slice(tripleRange1.first, tripleRange1.second)
+        val queryOuterTrajectory = outerTrajectory.slice(tripleRange1.first, tripleRange1.second)
         outerTrajectory = outerTrajectory.slice(0, tripleRange1.third)
 
         val usedTrajectory = sliceTrajectory(trajectory)
@@ -65,7 +65,7 @@ class TrajectoryRevisitor {
         if (range0.first < 0) {
             return false
         }
-        val subTrajectory = trajectory.slice(range0.first, range0.second)
+        val subTrajectory = usedTrajectory.slice(range0.first, range0.second)
         val range1 = Route.getMaximumSubPath(
             queryOuterTrajectory.points,
             usedOuterTrajectory.points,
@@ -74,7 +74,7 @@ class TrajectoryRevisitor {
         if (range1.first < 0) {
             return false
         }
-        val subOuterTrajectory = outerTrajectory.slice(range1.first, range1.second)
+        val subOuterTrajectory = usedOuterTrajectory.slice(range1.first, range1.second)
 
         val radiationField = RadiationField(subTrajectory, vMaxDistance)
         val impact = radiationField.calculateRadiationImpact(queryTrajectory)
