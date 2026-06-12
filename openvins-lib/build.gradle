@@ -35,13 +35,6 @@ android {
         }
     }
 
-    // 打包 AAR 时排除 opencv 的 .so 文件，避免消费方出现 so 重复冲突
-    packagingOptions {
-        exclude 'lib/arm64-v8a/libopencv_java4.so'
-        exclude 'lib/armeabi-v7a/libopencv_java4.so'
-        exclude 'lib/x86/libopencv_java4.so'
-        exclude 'lib/x86_64/libopencv_java4.so'
-    }
     externalNativeBuild {
         cmake {
             path "src/main/cpp/CMakeLists.txt"
