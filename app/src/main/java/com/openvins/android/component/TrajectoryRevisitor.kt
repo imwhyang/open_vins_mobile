@@ -4,6 +4,7 @@ import com.openvins.android.engine.Route
 import com.openvins.android.engine.Smoother
 import com.openvins.android.models.Pose
 import com.openvins.android.models.RadiationField
+import com.openvins.android.models.Result
 import com.openvins.android.models.SE3
 import com.openvins.android.models.Trajectory
 import glm_.vec3.Vec3d
@@ -19,11 +20,33 @@ class TrajectoryRevisitor {
     }
 
     fun searchRevisitTrajectory(
+        translations: FloatArray,
+        quaternions: FloatArray,
+        translation: DoubleArray,
+        quaternion: DoubleArray,
+    ): Result {
+        val dTranslations = DoubleArray(translations.size)
+        for (i in 0 until translations.size) {
+            dTranslations[i] = translations[i].toDouble()
+        }
+        val dQuaternions = DoubleArray(quaternions.size)
+        for (i in 0 until quaternions.size) {
+            dQuaternions[i] = quaternions[i].toDouble()
+        }
+        return searchRevisitTrajectory(
+            dTranslations,
+            dQuaternions,
+            translation,
+            quaternion,
+        )
+    }
+
+    fun searchRevisitTrajectory(
         translations: DoubleArray,
         quaternions: DoubleArray,
         translation: DoubleArray,
         quaternion: DoubleArray,
-    ): Boolean {
+    ): Result {
         var trajectory =
             Trajectory.create(translations, quaternions) + Pose.create(translation, quaternion)
 
@@ -38,13 +61,13 @@ class TrajectoryRevisitor {
         val tmpOuterMileage = Route.calculateMileage(outerTrajectory.points)
         val threshold = vMileage + vMaxDistance * 2.0
         if (tmpMileage < threshold || tmpOuterMileage < threshold) {
-            return false
+            return Result(false, 1.0, 0.0)
         }
 
         val tripleRange0 =
             Route.getMinimumSubPathReversed(trajectory.points, vMileage, vMaxDistance)
         if (tripleRange0.first < 0 || tripleRange0.third < 0) {
-            return false
+            return Result(false, 2.0, 0.0)
         }
         val queryTrajectory = trajectory.slice(tripleRange0.first, tripleRange0.second)
         trajectory = trajectory.slice(0, tripleRange0.third)
@@ -52,35 +75,23 @@ class TrajectoryRevisitor {
         val tripleRange1 =
             Route.getMinimumSubPathReversed(outerTrajectory.points, vMileage, vMaxDistance)
         if (tripleRange1.first < 0 || tripleRange1.third < 0) {
-            return false
+            return Result(false, 3.0, 0.0)
         }
         val queryOuterTrajectory = outerTrajectory.slice(tripleRange1.first, tripleRange1.second)
         outerTrajectory = outerTrajectory.slice(0, tripleRange1.third)
 
         val usedTrajectory = sliceTrajectory(trajectory)
         val usedOuterTrajectory = sliceTrajectory(outerTrajectory)
-        val range0 =
-            Route.getMaximumSubPath(queryTrajectory.points, usedTrajectory.points, vMaxDistance)
-        if (range0.first < 0) {
-            return false
-        }
-        val subTrajectory = usedTrajectory.slice(range0.first, range0.second)
-        val range1 = Route.getMaximumSubPath(
-            queryOuterTrajectory.points,
-            usedOuterTrajectory.points,
-            vMaxDistance
-        )
-        if (range1.first < 0) {
-            return false
-        }
-        val subOuterTrajectory = usedOuterTrajectory.slice(range1.first, range1.second)
 
-        val radiationField = RadiationField(subTrajectory, vMaxDistance)
+        val radiationField = RadiationField(usedTrajectory, vMaxDistance)
         val impact = radiationField.calculateRadiationImpact(queryTrajectory)
-        val outerRadiationField = RadiationField(subOuterTrajectory, vMaxDistance)
+        val outerRadiationField = RadiationField(usedOuterTrajectory, vMaxDistance)
         val outerImpact = outerRadiationField.calculateRadiationImpact(queryOuterTrajectory)
         val impactThreshold = _config.getOrElse("impactThreshold") { 0.5 } as Double
-        return impact >= impactThreshold && outerImpact >= impactThreshold
+        return Result(
+            impact >= impactThreshold && outerImpact >= impactThreshold,
+            impact, outerImpact
+        )
     }
 
     private fun buildOuterTrajectory(trajectory: Trajectory): Trajectory {
@@ -91,14 +102,14 @@ class TrajectoryRevisitor {
             val position = SE3.create(trajectory[i]) * initPoint
             outerPositions.add(position)
         }
-        return trajectory.copy(translations = outerPositions)
+        return Trajectory(translations = outerPositions, quaternions = trajectory.quaternions)
     }
 
     private fun smoothTrajectory(trajectory: Trajectory): Trajectory {
         val smoothPoints = Smoother.gaussianSmooth(
             trajectory.points,
             _config.getOrElse("smoothingSigma") { 1.0 } as Double)
-        return trajectory.copy(translations = smoothPoints)
+        return Trajectory(translations = smoothPoints, quaternions = trajectory.quaternions)
     }
 
     private fun sliceTrajectory(trajectory: Trajectory): Trajectory {

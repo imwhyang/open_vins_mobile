@@ -3,6 +3,12 @@ package com.openvins.android.models
 import glm_.quat.QuatD
 import glm_.vec3.Vec3d
 
+data class Result(
+    val isRevisit: Boolean,
+    val impact: Double,
+    val outerImpact: Double,
+)
+
 data class Pose(val translation: Vec3d, val quaternion: QuatD) {
     val position: Vec3d = translation
     val point: Vec3d = translation

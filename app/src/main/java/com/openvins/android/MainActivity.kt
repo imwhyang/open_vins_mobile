@@ -420,17 +420,17 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         val currQuatFloats = FloatArray(4) { currentQuat[it].toFloat() }
 
         // 判断路径重访状态
-        val isRevisit = trajectoryRevisitor.searchRevisitTrajectory(
-            positions, quaternions, currentPos, currentQuat
+        val result = trajectoryRevisitor.searchRevisitTrajectory(
+            posFloats, quatFloats, currentPos, currentQuat
         )
         tvPose?.text = String.format(
             "Pose: currPosFloats: %f %f %f  isRevisit %b",
             currPosFloats[0],
             currPosFloats[1],
             currPosFloats[2],
-            isRevisit
+            result.isRevisit
         )
-        if (isRevisit) {
+        if (result.isRevisit) {
             tvPose?.setTextColor(ContextCompat.getColor(this, R.color.red))
         } else {
             tvPose?.setTextColor(ContextCompat.getColor(this, R.color.white))

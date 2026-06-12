@@ -2,7 +2,7 @@ package com.openvins.android.engine
 
 import com.openvins.android.models.Trajectory
 import glm_.vec3.Vec3d
-import kotlin.math.hypot
+import kotlin.math.sqrt
 
 object Utils {
     fun distance2PointToTrajectory(p: Vec3d, path: Trajectory): Double {
@@ -21,8 +21,6 @@ object Utils {
     }
 
     fun distancePointToPoint(a: Vec3d, b: Vec3d): Double {
-        val dx = a.x - b.x
-        val dy = a.y - b.y
-        return hypot(dx, dy)
+        return sqrt(distance2PointToPoint(a, b))
     }
 }
