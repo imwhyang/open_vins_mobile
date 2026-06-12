@@ -26,7 +26,7 @@ class VioEngine {
      * @return 配置文件所在目录路径（即 externalFilesDir/config/）
      */
     fun copyConfigIfNeeded(context: Context): String {
-        val configDir = File(context.getExternalFilesDir(null), "config")
+        val configDir = File(context.filesDir, "config")
         if (!configDir.exists()) configDir.mkdirs()
 
         val assetFiles = listOf(

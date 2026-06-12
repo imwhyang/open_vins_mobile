@@ -103,45 +103,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
             ).show()
         }
 
-        // Our open folder button
-        // Use private external files directory root for config (app has full access)
-        // But use public Documents for recordings (user accessible)
-        val appPrivateFolderRoot = getExternalFilesDir(null)?.toString() ?: ""
-        val appRecordFolder =
-            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
-                .toString() + "/openvins/"
-        
-        // Ensure private config directory exists
-        val privateConfigDir = appPrivateFolderRoot + "/config/"
-        File(privateConfigDir).mkdirs()
-        
-        // Config files should be in private directory (pushed by sync script)
-        val privateConfigFile = File(privateConfigDir + "estimator_config.yaml")
-        if (!privateConfigFile.exists()) {
-            Log.w(TAG, "Config files not found in private directory. Please run sync script to push config files.")
-        } else {
-            Log.i(TAG, "Config files found in private directory")
-        }
-        
-        // Use private directory root for config, public directory for recordings
-        recordFolder = appRecordFolder
-        
-        // Automatically set the record folder without showing popup
-        val file = File(recordFolder)
-        if ((!file.isDirectory && !file.mkdirs()) || file.isFile) {
-            Toast.makeText(
-                applicationContext,
-                "ERROR: unable to create directory. ${file.toString()}",
-                Toast.LENGTH_LONG
-            ).show()
-        } else {
-            hasRecordFolder = true
-            vioEngine.copyConfigIfNeeded(this)
-            // Set recording directory (public, for user access)
-            vioEngine.setRecordFolder(recordFolder)
-            // Set private folder root (native code will add /config/ subdirectory)
-            vioEngine.setPrivateFolder(appPrivateFolderRoot)
-        }
+        // 权限申请是异步的，存储相关初始化在 onRequestPermissionsResult 权限授予后执行
 
         // Button for the user to change if they want to do that
         val fab_folder = findViewById(R.id.open_folder) as FloatingActionButton
@@ -219,17 +181,48 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     ) {
         when (requestCode) {
             PERMISSION_REQUEST -> {
-                if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                val cameraGranted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+                if (cameraGranted) {
                     mOpenCvCameraView!!.setCameraPermissionGranted()
                 } else {
                     Log.e(TAG, "Camera permission was not granted")
-                    Toast.makeText(this, "Camera permission was not granted", Toast.LENGTH_LONG)
-                        .show()
+                    Toast.makeText(this, "Camera permission was not granted", Toast.LENGTH_LONG).show()
                 }
+                // 权限授予后（无论存储权限是否获得）执行初始化
+                // Android 10+ 访问 getExternalFilesDir 不需要存储权限
+                initFoldersAndConfig()
             }
             else -> {
                 Log.e(TAG, "Unexpected permission request")
             }
+        }
+    }
+
+    /**
+     * 初始化录制目录与配置文件，需在存储权限确认后调用。
+     */
+    private fun initFoldersAndConfig() {
+        val appPrivateFolderRoot = filesDir.toString()
+        val appRecordFolder =
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+                .toString() + "/openvins/"
+
+        recordFolder = appRecordFolder
+        val file = File(recordFolder)
+        if ((!file.isDirectory && !file.mkdirs()) || file.isFile) {
+            Toast.makeText(
+                applicationContext,
+                "ERROR: unable to create directory. $recordFolder",
+                Toast.LENGTH_LONG
+            ).show()
+        } else {
+            hasRecordFolder = true
+            // 从 assets 解压配置文件到私有目录（仅首次）
+            vioEngine.copyConfigIfNeeded(this)
+            // 设置录制目录（公共，用户可访问）
+            vioEngine.setRecordFolder(recordFolder)
+            // 设置私有目录根路径（原生层会在其下查找 /config/ 子目录）
+            vioEngine.setPrivateFolder(appPrivateFolderRoot)
         }
     }
 
