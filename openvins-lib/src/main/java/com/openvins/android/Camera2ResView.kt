@@ -549,6 +549,15 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
         return false
     }
 
+    override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
+        super.onLayout(changed, left, top, right, bottom)
+        // 布局完成后（View 有了实际宽高），重新检查状态以连接相机。
+        // 解决 Fragment 首次展示时 enableView() 早于布局完成导致预览无法创建的问题。
+        if (right - left > 0 && bottom - top > 0) {
+            checkState()
+        }
+    }
+
     override fun surfaceCreated(holder: SurfaceHolder) {
         // Do nothing, wait for surfaceChanged
     }
