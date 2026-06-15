@@ -56,7 +56,7 @@ data class Trajectory(
                     Vec3d(
                         translations[3 * i],
                         translations[3 * i + 1],
-                        translations[3 * i + 1] + 2
+                        translations[3 * i + 2]
                     )
                 )
                 if (order == "sxyz") {
