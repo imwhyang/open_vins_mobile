@@ -13,7 +13,7 @@ android {
         minSdkVersion 21
         targetSdkVersion 30
         versionCode 1
-        versionName "1.0.8"
+        versionName "1.0.11"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild {
@@ -66,7 +66,7 @@ afterEvaluate {
                 from components.release
                 groupId = 'com.github.openvins'
                 artifactId = 'openvins-lib'
-                version = '1.0.8'
+                version = '1.0.10'
 
                 // 移除本地子模块依赖，防止消费方编译失败
                 pom.withXml {

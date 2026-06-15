@@ -255,7 +255,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         val appPrivateFolderRoot = filesDir.toString()
         val appRecordFolder =
             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
-                .toString() + "/openvins/"
+                .toString() + "/openvins/pose"
 
         recordFolder = appRecordFolder
         val file = File(recordFolder)

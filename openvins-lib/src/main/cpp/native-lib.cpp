@@ -321,15 +321,13 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setAppReco
   __android_log_print(ANDROID_LOG_INFO, TAG, "export app record folder: %s\n", app_record_folder.c_str());
 }
 
-extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setAppPrivateFolderJNI(JNIEnv *env, jobject instance,
-                                                                                                jstring dir) {
+extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setAppPrivateFolderJNI(JNIEnv *env, jobject instance, jstring dir) {
   const char *temp = env->GetStringUTFChars(dir, NULL);
   app_private_folder = std::string(temp);
   __android_log_print(ANDROID_LOG_INFO, TAG, "export app private folder: %s\n", app_private_folder.c_str());
 }
 
-extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setRecordStateJNI(JNIEnv *env, jobject instance,
-                                                                                           jboolean stateAddr) {
+extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setRecordStateJNI(JNIEnv *env, jobject instance, jboolean stateAddr) {
   is_recording = (bool)stateAddr;
   if (is_recording) {
 
@@ -346,19 +344,27 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setRecordS
     if (!normalized_app_record_folder.empty() && normalized_app_record_folder.back() == '/') {
       normalized_app_record_folder.pop_back();
     }
-    save_folder = normalized_app_record_folder + "/" + s + "/";
+    //  修改保存路径与文件名
+    save_folder = normalized_app_record_folder + "/";
+    //    save_folder = normalized_app_record_folder + "/" + s + "/";
 
     // Make the folder if not there
     struct stat st = {0};
     if (stat(save_folder.c_str(), &st) == -1) {
       mkdir(save_folder.c_str(), 0700);
     }
-    mkdir((save_folder + "cam0/").c_str(), 0700);
+    //    取消保存图片
+    //    mkdir((save_folder + "cam0/").c_str(), 0700);
 
+    //    文件名加时间
     // Open our IMU csv file
-    imu_csv.open(save_folder + "imu0.csv");
-    imu_csv << "timestamp,omega_x,omega_y,omega_z,alpha_x,alpha_y,alpha_z" << std::endl;
-    pose_ext_csv.open(save_folder + "pose0.csv");
+    //    imu_csv.open(save_folder + "imu0.csv");
+    //    std::string imu_csv_name = s + "imu0.csv";
+    //    imu_csv.open(save_folder + imu_csv_name);
+    //    imu_csv << "timestamp,omega_x,omega_y,omega_z,alpha_x,alpha_y,alpha_z" << std::endl;
+    //   只保留Pose数据
+    std::string pose_csv_name = s + "pose0.csv";
+    pose_ext_csv.open(save_folder + pose_csv_name);
     pose_ext_csv << "timestamp,p_x,p_y,p_z,q_x,q_y,q_z,q_w" << std::endl;
   } else {
 
@@ -372,8 +378,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setRecordS
   }
 }
 
-extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_toggleSystemJNI(JNIEnv *env, jobject instance,
-                                                                                         jboolean stateAddr) {
+extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_toggleSystemJNI(JNIEnv *env, jobject instance, jboolean stateAddr) {
   is_running_ov = (bool)stateAddr;
   if (!is_running_ov) {
     // Stop the system: shutdown immediately
@@ -454,10 +459,9 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_toggleSyst
 }
 
 extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_processYUVToRGBAJNI(JNIEnv *env, jobject clazz, jbyteArray yData,
-                                                                                                jbyteArray uData, jbyteArray vData,
-                                                                                                jint width, jint height, jint yStride,
-                                                                                                jint uStride, jint vStride,
-                                                                                                jint chromaPixelStride) {
+                                                                                           jbyteArray uData, jbyteArray vData, jint width,
+                                                                                           jint height, jint yStride, jint uStride,
+                                                                                           jint vStride, jint chromaPixelStride) {
   // This is a helper function to convert YUV to RGBA in native code
   // Creates Mat in native code and returns its address
 
@@ -590,7 +594,7 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_processYU
 
 // Get display image - returns raw camera if not running, or viz image with overlays if running
 extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_getDisplayImageJNI(JNIEnv *env, jobject clazz,
-                                                                                               jlong rawCameraMatAddr) {
+                                                                                          jlong rawCameraMatAddr) {
   // If not running, just return the raw camera image (converted to RGB)
   if (!is_running_ov || sys == nullptr) {
     if (rawCameraMatAddr == 0) {
@@ -662,7 +666,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_deleteMatJ
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processImageJNI(JNIEnv *env, jobject instance, jlong matAddr,
-                                                                                         jdouble timestampSec) {
+                                                                                      jdouble timestampSec) {
 
   // Use the hardware timestamp from Camera2 (nanoseconds since boot, converted to seconds)
   // This ensures consistent frame-to-frame timing and matches IMU timestamp reference
@@ -677,12 +681,12 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIma
   cv::Mat mat_gray;
   cv::cvtColor(mat, mat_gray, cv::COLOR_RGBA2GRAY);
 
-  // If recording save to disk
-  if (is_recording) {
-    std::string filename = save_folder + "cam0/" + std::to_string(time_in_ns) + ".png";
-    cv::imwrite(filename, mat_gray);
-    __android_log_print(ANDROID_LOG_INFO, TAG, "saved file: %s\n", filename.c_str());
-  }
+  // If recording save to disk 取消保存图片
+  //  if (is_recording) {
+  //    std::string filename = save_folder + "cam0/" + std::to_string(time_in_ns) + ".png";
+  //    cv::imwrite(filename, mat_gray);
+  //    __android_log_print(ANDROID_LOG_INFO, TAG, "saved file: %s\n", filename.c_str());
+  //  }
 
   // Return if the app record folder has not been set yet
   if (!app_record_folder_set) {
@@ -832,8 +836,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIma
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processInertialJNI(JNIEnv *env, jobject instance, jfloat ax,
-                                                                                            jfloat ay, jfloat az, jfloat gx, jfloat gy,
-                                                                                            jfloat gz, jdouble timestampSec) {
+                                                                                         jfloat ay, jfloat az, jfloat gx, jfloat gy,
+                                                                                         jfloat gz, jdouble timestampSec) {
 
   // Use the hardware timestamp from SensorEvent (nanoseconds since boot, converted to seconds)
   // This ensures consistent timing and matches camera timestamp reference
@@ -851,7 +855,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIne
   // If recording save to disk
   if (is_recording && imu_csv.is_open()) {
     imu_csv << time_in_ns << "," << n_gx << "," << n_gy << "," << n_gz << "," << n_ax << "," << n_ay << "," << n_az << std::endl;
-    __android_log_print(ANDROID_LOG_INFO, TAG, "%.4f, %.4f, %.4f | %.4f, %.4f, %.4f \n", n_ax, n_ay, n_az, n_gx, n_gy, n_gz);
+    //    __android_log_print(ANDROID_LOG_INFO, TAG, "%.4f, %.4f, %.4f | %.4f, %.4f, %.4f \n", n_ax, n_ay, n_az, n_gx, n_gy, n_gz);
   }
 
   // Feed if the system is running!
@@ -874,8 +878,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIne
 
 // JNI functions for trajectory visualization
 extern "C" JNIEXPORT jboolean JNICALL Java_com_openvins_android_VioEngine_getCurrentPoseJNI(JNIEnv *env, jobject instance,
-                                                                                               jdoubleArray position,
-                                                                                               jdoubleArray quaternion) {
+                                                                                            jdoubleArray position,
+                                                                                            jdoubleArray quaternion) {
   if (sys == nullptr || !is_running_ov) {
     return JNI_FALSE;
   }
@@ -907,8 +911,8 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_openvins_android_VioEngine_getCur
 
   if (is_recording && pose_ext_csv.is_open()) {
     unsigned long long time_in_ns = (unsigned long long)(state->_timestamp * 1e9);
-    pose_ext_csv << time_in_ns << "," << p_cam(0) << "," << p_cam(1) << "," << p_cam(2) << "," << q_cam(0) << "," << q_cam(1) << "," << q_cam(2)
-                 << "," << q_cam(3) << std::endl;
+    pose_ext_csv << time_in_ns << "," << p_cam(0) << "," << p_cam(1) << "," << p_cam(2) << "," << q_cam(0) << "," << q_cam(1) << ","
+                 << q_cam(2) << "," << q_cam(3) << std::endl;
   }
 
   env->SetDoubleArrayRegion(position, 0, 3, pos);
@@ -918,8 +922,8 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_openvins_android_VioEngine_getCur
 }
 
 extern "C" JNIEXPORT jint JNICALL Java_com_openvins_android_VioEngine_getTrajectoryDataJNI(JNIEnv *env, jobject instance,
-                                                                                              jdoubleArray positions,
-                                                                                              jdoubleArray quaternions) {
+                                                                                           jdoubleArray positions,
+                                                                                           jdoubleArray quaternions) {
   std::lock_guard<std::mutex> lck(trajectory_mtx);
 
   size_t size = trajectory_history.size();
