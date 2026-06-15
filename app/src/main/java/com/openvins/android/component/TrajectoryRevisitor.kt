@@ -2,10 +2,12 @@ package com.openvins.android.component
 
 import com.openvins.android.engine.Route
 import com.openvins.android.engine.Smoother
+import com.openvins.android.engine.Utils
 import com.openvins.android.models.Pose
 import com.openvins.android.models.RadiationField
 import com.openvins.android.models.Result
 import com.openvins.android.models.SE3
+import com.openvins.android.models.SO3
 import com.openvins.android.models.Trajectory
 import glm_.vec3.Vec3d
 import kotlin.math.max
@@ -15,8 +17,11 @@ class TrajectoryRevisitor {
     private var _revisitMileage: Double = 1.5
     private var _maxDistance: Double = 0.5
     private var _impactThreshold: Double = 0.5
+    private var _absPoseErrRotFro: Double = 0.1
+    private var _pointDistance: Double = 0.5
+
     private var _smoothingSigma: Double = 1.0
-    private var _sliceRemind: Int = 200
+    private var _sliceRemind: Int = 300
     private var _minTrajectoryLength: Int = 20
 
     constructor() {}
@@ -106,6 +111,33 @@ class TrajectoryRevisitor {
         )
     }
 
+    fun queryVisitedPoses(
+        candidateTranslations: List<DoubleArray>,
+        candidateQuaternions: List<DoubleArray>,
+        queryTranslation: DoubleArray,
+        queryQuaternion: DoubleArray,
+    ): Result {
+        if (candidateTranslations.size != candidateQuaternions.size) {
+            return Result(false)
+        }
+        val invQueryPose = SO3.create(queryQuaternion).inverse()
+        for (i in candidateTranslations.indices) {
+            val candidatePose = SO3.create(candidateQuaternions[i])
+            val resultQuat = (invQueryPose * candidatePose).toQuat()
+            val absPoseErrRotFro = Vec3d(resultQuat.x, resultQuat.y, resultQuat.z).length()
+            val pointDistance =
+                Utils.distancePointToPoint3d(candidateTranslations[i], queryTranslation)
+            if (absPoseErrRotFro < _absPoseErrRotFro && pointDistance < _pointDistance) {
+                return Result(
+                    true,
+                    absPoseErrRotFro = absPoseErrRotFro,
+                    pointDistance = pointDistance
+                )
+            }
+        }
+        return Result(false)
+    }
+
     private fun buildOuterTrajectory(trajectory: Trajectory): Trajectory {
         val initPoint = Vec3d(1.0, 0.0, 0.0)
         val n = trajectory.size()
@@ -119,7 +151,8 @@ class TrajectoryRevisitor {
 
     private fun smoothTrajectory(trajectory: Trajectory): Trajectory {
         val smoothPoints = Smoother.gaussianSmooth(
-            trajectory.points, _smoothingSigma)
+            trajectory.points, _smoothingSigma
+        )
         return Trajectory(translations = smoothPoints, quaternions = trajectory.quaternions)
     }
 

@@ -18,7 +18,7 @@ class SO3(val matrix: Mat3d) {
             val z = norm.z
             val w = norm.w
             val mat = Mat3d(
-                1.0 - 2  * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
+                1.0 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
                 2 * (x * y + z * w), 1.0 - 2 * (x * x + z * z), 2 * (y * z - x * w),
                 2 * (x * z - y * w), 2 * (y * z + x * w), 1.0 - 2 * (x * x + y * y)
             )
@@ -37,6 +37,9 @@ class SO3(val matrix: Mat3d) {
     }
     fun inverse(): SO3 {
         return SO3(this.matrix.transpose()) // 对于旋转矩阵，逆等于转置
+    }
+    fun toQuat(): QuatD {
+        return matrix.toQuatD()
     }
 }
 

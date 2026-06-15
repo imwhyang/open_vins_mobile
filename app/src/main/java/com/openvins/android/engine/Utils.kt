@@ -2,6 +2,7 @@ package com.openvins.android.engine
 
 import com.openvins.android.models.Trajectory
 import glm_.vec3.Vec3d
+import kotlin.math.pow
 import kotlin.math.sqrt
 
 object Utils {
@@ -22,5 +23,13 @@ object Utils {
 
     fun distancePointToPoint(a: Vec3d, b: Vec3d): Double {
         return sqrt(distance2PointToPoint(a, b))
+    }
+
+    fun distancePointToPoint3d(a: DoubleArray, b: DoubleArray): Double {
+        var summary = 0.0
+        for (i in 0 until 3) {
+            summary += (a[i] - b[i]).pow(2.0)
+        }
+        return sqrt(summary)
     }
 }

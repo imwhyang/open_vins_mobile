@@ -5,8 +5,10 @@ import glm_.vec3.Vec3d
 
 data class Result(
     val isRevisit: Boolean,
-    val impact: Double,
-    val outerImpact: Double,
+    val impact: Double = 0.0,
+    val outerImpact: Double = 0.0,
+    val absPoseErrRotFro: Double = 0.0,
+    val pointDistance: Double = 0.0
 )
 
 data class Pose(val translation: Vec3d, val quaternion: QuatD) {
