@@ -16,7 +16,7 @@ class TrajectoryRevisitor {
     private val _config: Map<String, Any> = emptyMap()
     private var _revisitMileage: Double = 1.5
     private var _maxDistance: Double = 0.5
-    private var _impactThreshold: Double = 0.5
+    private var _impactThreshold: Double = 0.35
     private var _absPoseErrRotFro: Double = 0.1
     private var _pointDistance: Double = 0.5
 
@@ -37,23 +37,23 @@ class TrajectoryRevisitor {
         _minTrajectoryLength = _config.getOrElse("minTrajectoryLength") { 20 } as Int
     }
 
+    private fun f2d(v: FloatArray): DoubleArray {
+        val d = DoubleArray(v.size)
+        for ((i, element) in v.withIndex()) {
+            d[i] = element.toDouble()
+        }
+        return d
+    }
+
     fun searchRevisitTrajectory(
         translations: FloatArray,
         quaternions: FloatArray,
         translation: DoubleArray,
         quaternion: DoubleArray,
     ): Result {
-        val dTranslations = DoubleArray(translations.size)
-        for (i in 0 until translations.size) {
-            dTranslations[i] = translations[i].toDouble()
-        }
-        val dQuaternions = DoubleArray(quaternions.size)
-        for (i in 0 until quaternions.size) {
-            dQuaternions[i] = quaternions[i].toDouble()
-        }
         return searchRevisitTrajectory(
-            dTranslations,
-            dQuaternions,
+            f2d(translations),
+            f2d(quaternions),
             translation,
             quaternion,
         )
@@ -136,6 +136,55 @@ class TrajectoryRevisitor {
             }
         }
         return Result(false)
+    }
+
+    fun captureRevisited(
+        translations: FloatArray,
+        quaternions: FloatArray,
+        translation: DoubleArray,
+        quaternion: DoubleArray,
+        candidateTranslations: List<DoubleArray>,
+        candidateQuaternions: List<DoubleArray>,
+        queryTranslation: DoubleArray,
+        queryQuaternion: DoubleArray,
+    ): Result {
+        return captureRevisited(
+            f2d(translations),
+            f2d(quaternions),
+            translation,
+            quaternion,
+            candidateTranslations,
+            candidateQuaternions,
+            queryTranslation,
+            queryQuaternion,
+        )
+    }
+
+    fun captureRevisited(
+        translations: DoubleArray,
+        quaternions: DoubleArray,
+        translation: DoubleArray,
+        quaternion: DoubleArray,
+        candidateTranslations: List<DoubleArray>,
+        candidateQuaternions: List<DoubleArray>,
+        queryTranslation: DoubleArray,
+        queryQuaternion: DoubleArray,
+    ): Result {
+        val result0 = searchRevisitTrajectory(translations, quaternions, translation, quaternion)
+        val result1 = queryVisitedPoses(
+            candidateTranslations,
+            candidateQuaternions,
+            queryTranslation,
+            queryQuaternion
+        )
+        val result = Result(
+            result0.isRevisit || result1.isRevisit,
+            impact = result0.impact,
+            outerImpact = result0.outerImpact,
+            absPoseErrRotFro = result1.absPoseErrRotFro,
+            pointDistance = result1.pointDistance,
+        )
+        return result
     }
 
     private fun buildOuterTrajectory(trajectory: Trajectory): Trajectory {
