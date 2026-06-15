@@ -92,6 +92,9 @@ object Smoother {
                 // reflect border
                 if (idx < 0) idx = -idx - 1
                 if (idx >= n) idx = 2 * n - idx - 1
+                // clamp border
+                if (idx < 0) idx = 0
+                if (idx >= n) idx = n - 1
                 acc += data[idx] * kernel[k + radius]
             }
             out[i] = acc
