@@ -17,6 +17,7 @@ class TrajectoryRevisitor {
     private var _impactThreshold: Double = 0.5
     private var _smoothingSigma: Double = 1.0
     private var _sliceRemind: Int = 200
+    private var _minTrajectoryLength: Int = 20
 
     constructor() {}
 
@@ -25,8 +26,10 @@ class TrajectoryRevisitor {
         _revisitMileage = _config.getOrElse("revisitMileage") { 1.5 } as Double
         _maxDistance = _config.getOrElse("maxDistance") { 0.5 } as Double
         _impactThreshold = _config.getOrElse("impactThreshold") { 0.5 } as Double
+
         _smoothingSigma = _config.getOrElse("smoothingSigma") { 1.0 } as Double
         _sliceRemind = _config.getOrElse("sliceRemind") { 200 } as Int
+        _minTrajectoryLength = _config.getOrElse("minTrajectoryLength") { 20 } as Int
     }
 
     fun searchRevisitTrajectory(
@@ -59,6 +62,9 @@ class TrajectoryRevisitor {
     ): Result {
         var trajectory =
             Trajectory.create(translations, quaternions) + Pose.create(translation, quaternion)
+        if (trajectory.size() <= _minTrajectoryLength) {
+            return Result(false, 0.0, 0.0)
+        }
 
         var outerTrajectory = buildOuterTrajectory(trajectory)
         trajectory = smoothTrajectory(trajectory)
