@@ -94,9 +94,8 @@ class TrajectoryRevisitor {
         val impact = radiationField.calculateRadiationImpact(queryTrajectory)
         val outerRadiationField = RadiationField(usedOuterTrajectory, _maxDistance)
         val outerImpact = outerRadiationField.calculateRadiationImpact(queryOuterTrajectory)
-        val impactThreshold = _config.getOrElse("impactThreshold") { 0.5 } as Double
         return Result(
-            impact >= impactThreshold && outerImpact >= impactThreshold,
+            impact >= _impactThreshold && outerImpact >= _impactThreshold,
             impact, outerImpact
         )
     }
