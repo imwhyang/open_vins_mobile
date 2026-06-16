@@ -28,6 +28,7 @@ import com.google.android.material.floatingactionbutton.FloatingActionButton
 import java.io.File
 import android.os.Handler
 import android.os.Looper
+import android.widget.Button
 import android.widget.TextView
 import androidx.core.content.ContextCompat
 import com.openvins.android.component.TrajectoryRevisitor
@@ -59,6 +60,8 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     }
 
     private var vioEngine = VioEngine()
+   private val candidateTranslations: ArrayList<DoubleArray> = arrayListOf()
+   private val candidateQuaternions: ArrayList<DoubleArray> = arrayListOf()
 
     init {
         Log.i(TAG, "Instantiated new " + this.javaClass)
@@ -216,6 +219,11 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
                     }else
                         Log.i("TAG", "轨迹图保存失败")
                 }
+            }
+
+            val toggleCheck = findViewById(R.id.toggle_check) as Button
+            toggleCheck.setOnClickListener {
+                checkCurrentPost()
             }
         }
 
@@ -420,8 +428,74 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         val currQuatFloats = FloatArray(4) { currentQuat[it].toFloat() }
 
         // 判断路径重访状态
-        val result = trajectoryRevisitor.searchRevisitTrajectory(
-            posFloats, quatFloats, currentPos, currentQuat
+//        val result = trajectoryRevisitor.searchRevisitTrajectory(
+//            posFloats, quatFloats, currentPos, currentQuat
+//        )
+//        tvPose?.text = String.format(
+//            "Pose: currPosFloats: %f %f %f  isRevisit %b",
+//            currPosFloats[0],
+//            currPosFloats[1],
+//            currPosFloats[2],
+//            result.isRevisit
+//        )
+//        if (result.isRevisit) {
+//            tvPose?.setTextColor(ContextCompat.getColor(this, R.color.red))
+//        } else {
+//            tvPose?.setTextColor(ContextCompat.getColor(this, R.color.white))
+//        }
+
+
+        // Update the 3D view
+        trajectoryView?.updateTrajectory(posFloats, quatFloats, currPosFloats, currQuatFloats)
+    }
+
+    private fun checkCurrentPost() {
+        // Get current pose
+        val currentPos = DoubleArray(3)
+        val currentQuat = DoubleArray(4)
+        if (!vioEngine.getCurrentPose(currentPos, currentQuat)) {
+            return // System not initialized
+        }
+
+        // Allocate arrays with maximum expected size (MAX_TRAJECTORY_POINTS = 10000)
+        val maxSize = 10000
+        val positions = DoubleArray(maxSize * 3)
+        val quaternions = DoubleArray(maxSize * 4)
+
+        val trajectorySize = vioEngine.getTrajectoryData(positions, quaternions)
+
+        if (trajectorySize == 0) {
+            // Empty trajectory or error
+            trajectoryView?.updateTrajectory(
+                floatArrayOf(), floatArrayOf(),
+                FloatArray(3) { currentPos[it].toFloat() },
+                FloatArray(4) { currentQuat[it].toFloat() })
+            return
+        }
+
+        // Convert only the actual number of points to float arrays
+        val posFloats = FloatArray(trajectorySize * 3)
+        val quatFloats = FloatArray(trajectorySize * 4)
+        for (i in 0 until trajectorySize * 3) {
+            posFloats[i] = positions[i].toFloat()
+        }
+        for (i in 0 until trajectorySize * 4) {
+            quatFloats[i] = quaternions[i].toFloat()
+        }
+
+        val currPosFloats = FloatArray(3) { currentPos[it].toFloat() }
+        val currQuatFloats = FloatArray(4) { currentQuat[it].toFloat() }
+
+        // 判断路径重访状态
+        val result = trajectoryRevisitor.captureRevisited(
+            posFloats,
+            quatFloats,
+            currentPos,
+            currentQuat,
+            candidateTranslations,
+            candidateQuaternions,
+            currentPos,
+            currentQuat
         )
         tvPose?.text = String.format(
             "Pose: currPosFloats: %f %f %f  isRevisit %b",
@@ -434,11 +508,10 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
             tvPose?.setTextColor(ContextCompat.getColor(this, R.color.red))
         } else {
             tvPose?.setTextColor(ContextCompat.getColor(this, R.color.white))
+            candidateTranslations.add(currentPos)
+            candidateQuaternions.add(currentQuat)
         }
 
-
-        // Update the 3D view
-        trajectoryView?.updateTrajectory(posFloats, quatFloats, currPosFloats, currQuatFloats)
     }
 
     companion object {
