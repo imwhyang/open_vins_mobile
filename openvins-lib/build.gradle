@@ -53,6 +53,8 @@ dependencies {
     implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
     implementation 'androidx.core:core-ktx:1.2.0'
     implementation 'androidx.appcompat:appcompat:1.1.0'
+    implementation "io.github.kotlin-graphics:glm:0.9.9.1-12"
+
     // OpenCV 本地子模块依赖，编译和运行时均需要；
     // 在 POM 发布时会被手动移除，消费方不需单独添加
     implementation project(':thirdparty:opencv')
