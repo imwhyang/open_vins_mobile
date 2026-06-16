@@ -1,6 +1,20 @@
+#jdk:
+#  - openjdk11
+#before_install:
+#  - sdk install java 11.0.10-open || true
 jdk:
-  - openjdk11
+  - openjdk17
 before_install:
-  - sdk install java 11.0.10-open || true
+  - sdk install java 17.0.9-open || true
+  - sdk use java 17.0.9-open
 install:
   - ./gradlew :openvins-lib:publishReleasePublicationToMavenLocal
+
+
+#jdk:
+#  - openjdk17
+#before_install:
+#  - sdk install java 17.0.9-open || true
+#  - sdk use java 17.0.9-open
+#install:
+#  - ./gradlew :openvins-lib:assembleRelease :openvins-lib:publishReleasePublicationToMavenLocal
