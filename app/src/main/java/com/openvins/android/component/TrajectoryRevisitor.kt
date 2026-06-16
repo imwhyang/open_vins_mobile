@@ -126,7 +126,7 @@ class TrajectoryRevisitor {
             val resultQuat = (invQueryPose * candidatePose).toQuat()
             val absPoseErrRotFro = Vec3d(resultQuat.x, resultQuat.y, resultQuat.z).length()
             val pointDistance =
-                Utils.distancePointToPoint3d(candidateTranslations[i], queryTranslation)
+                Utils.distancePointToPoint(candidateTranslations[i], queryTranslation)
             if (absPoseErrRotFro < _absPoseErrRotFro && pointDistance < _pointDistance) {
                 return Result(
                     true,

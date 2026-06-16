@@ -25,6 +25,14 @@ object Utils {
         return sqrt(distance2PointToPoint(a, b))
     }
 
+    fun distancePointToPoint(a: DoubleArray, b: DoubleArray): Double {
+        var summary = 0.0
+        for (i in 0 until 2) {
+            summary += (a[i] - b[i]).pow(2.0)
+        }
+        return sqrt(summary)
+    }
+
     fun distancePointToPoint3d(a: DoubleArray, b: DoubleArray): Double {
         var summary = 0.0
         for (i in 0 until 3) {
