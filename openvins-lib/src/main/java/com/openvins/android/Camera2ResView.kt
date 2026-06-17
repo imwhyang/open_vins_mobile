@@ -60,6 +60,9 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
 
     private var mFrameListener: CameraFrameListener? = null
     private var mEnabled = false
+    // 相机是否活跃，退出时先置 false 让 onImageAvailable 丢弃后续帧
+    @Volatile
+    private var mIsCameraActive = false
     private var mCameraPermissionGranted = false
 
     // ---- 视频录制相关 ----
@@ -151,6 +154,8 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
 
     private fun disconnectCamera() {
         Log.i(TAG, "disconnectCamera")
+        // 标记相机正在关闭，让 onImageAvailable 回调丢弃后续帧
+        mIsCameraActive = false
         // 断开相机前，若正在录制则自动停止
         if (mIsRecording) {
             Log.i(TAG, "Auto-stopping recording due to camera disconnect")
@@ -301,12 +306,20 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
                 return
             }
 
+            mIsCameraActive = true
             mImageReader = ImageReader.newInstance(w, h, mPreviewFormat, 2)
             mImageReader!!.setOnImageAvailableListener({ reader ->
                 val image = reader.acquireLatestImage()
                 if (image == null)
                     return@setOnImageAvailableListener
 
+                // 相机正在关闭时，丢弃帧避免访问已关闭的 Image
+                if (!mIsCameraActive) {
+                    image.close()
+                    return@setOnImageAvailableListener
+                }
+
+                try {
                 // Get hardware timestamp from the Image (nanoseconds since boot)
                 val frameTimestampNs = image.timestamp
                 lastFrameTimestampSec = frameTimestampNs * 1e-9
@@ -384,7 +397,6 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
                             }
                         }
                     }
-                    image.close()
                     return@setOnImageAvailableListener
                 }
                 
@@ -462,7 +474,18 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
                     }
                 }
 
-                image.close()
+                } catch (e: IllegalStateException) {
+                    // Image 可能在处理过程中被关闭（退出时竞态）
+                    Log.w(TAG, "Image closed during processing", e)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error processing frame", e)
+                } finally {
+                    try {
+                        image.close()
+                    } catch (_: Exception) {
+                        // Image 可能已经被关闭
+                    }
+                }
             }, mBackgroundHandler)
             
             mPreviewRequestBuilder = mCameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)

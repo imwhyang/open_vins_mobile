@@ -315,14 +315,12 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         trajectoryUpdateHandler.post(trajectoryUpdateRunnable)
     }
 
-    public override fun onDestroy() {
-        super.onDestroy()
+    public override fun onStop() {
+        super.onStop()
         val stopRecording = mOpenCvCameraView!!.stopRecording()
         if (stopRecording != null) {
             Log.d(TAG, "Stopped recording: $stopRecording")
         }
-
-
         // Stop trajectory updates
         trajectoryUpdateHandler.removeCallbacks(trajectoryUpdateRunnable)
 
