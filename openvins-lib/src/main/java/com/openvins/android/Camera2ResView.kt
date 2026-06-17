@@ -309,9 +309,8 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
             mIsCameraActive = true
             mImageReader = ImageReader.newInstance(w, h, mPreviewFormat, 2)
             mImageReader!!.setOnImageAvailableListener({ reader ->
-                val image = reader.acquireLatestImage()
-                if (image == null)
-                    return@setOnImageAvailableListener
+//                val image = reader.acquireLatestImage()
+                val image = reader.acquireNextImage() ?: return@setOnImageAvailableListener
 
                 // 相机正在关闭时，丢弃帧避免访问已关闭的 Image
                 if (!mIsCameraActive) {

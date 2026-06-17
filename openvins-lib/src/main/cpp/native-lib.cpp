@@ -106,6 +106,11 @@ std::vector<TrajectoryPoint> trajectory_history;
 std::mutex trajectory_mtx;
 const size_t MAX_TRAJECTORY_POINTS = 10000; // Limit trajectory size
 
+// Occlusion recovery: suppress trajectory appending for N frames after occlusion ends
+// This prevents the "drift pop" visible when VIO restabilizes after a covered lens.
+const int OCCLUSION_RECOVERY_FRAMES = 10; // wait 10 frames (~0.3s at 31Hz) after occlusion
+std::atomic<int> occlusion_recovery_counter(0); // counts down to 0; >0 means suppressed
+
 // JNI OnLoad/OnUnload handlers for proper cleanup
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) { return JNI_VERSION_1_6; }
 
@@ -233,7 +238,7 @@ void processing_worker_thread() {
 
       // Process this camera measurement (lock is released during this call)
       auto t_feed_start = boost::posix_time::microsec_clock::local_time();
-      double update_dt = 100.0 * (timestamp_imu_inC - cam_msg.timestamp);
+      double update_dt = 1000.0 * (timestamp_imu_inC - cam_msg.timestamp);
       sys->feed_measurement_camera(cam_msg);
       auto t_feed_end = boost::posix_time::microsec_clock::local_time();
       double time_feed = (t_feed_end - t_feed_start).total_microseconds() * 1e-6;
@@ -273,9 +278,19 @@ void processing_worker_thread() {
         // Store trajectory point (camera pose)
         // q_cam is JPL format [qx, qy, qz, qw], but TrajectoryPoint expects [qw, qx, qy, qz]
         std::lock_guard<std::mutex> traj_lck(trajectory_mtx);
-        trajectory_history.emplace_back(p_cam(0), p_cam(1), p_cam(2), q_cam(3), q_cam(0), q_cam(1), q_cam(2));
-        if (trajectory_history.size() > MAX_TRAJECTORY_POINTS) {
-          trajectory_history.erase(trajectory_history.begin());
+
+        // After occlusion, wait for VIO to restabilize before appending trajectory points.
+        // occlusion_recovery_counter is set to OCCLUSION_RECOVERY_FRAMES when occlusion ends
+        // and counts down to 0 each processed frame.
+        int recovery = occlusion_recovery_counter.load();
+        if (recovery > 0) {
+          occlusion_recovery_counter.store(recovery - 1);
+          __android_log_print(ANDROID_LOG_DEBUG, TAG, "[OCCLUSION] Recovery suppression: %d frames remaining\n", recovery);
+        } else {
+          trajectory_history.emplace_back(p_cam(0), p_cam(1), p_cam(2), q_cam(3), q_cam(0), q_cam(1), q_cam(2));
+          if (trajectory_history.size() > MAX_TRAJECTORY_POINTS) {
+            trajectory_history.erase(trajectory_history.begin());
+          }
         }
 
         // Display the current state
@@ -418,6 +433,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_toggleSyst
     viz_state1 = "";
     viz_state2 = "";
     viz_state3 = "";
+    occlusion_recovery_counter.store(0);
 
     __android_log_print(ANDROID_LOG_INFO, TAG, "OpenVINS system stopped\n");
   } else {
@@ -448,6 +464,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_toggleSyst
     viz_state1 = "";
     viz_state2 = "";
     viz_state3 = "";
+    occlusion_recovery_counter.store(0);
 
     // Start the worker thread
     if (!thread_running) {
@@ -680,6 +697,21 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIma
   // Convert to gray scale (Mat is RGBA from YUV conversion)
   cv::Mat mat_gray;
   cv::cvtColor(mat, mat_gray, cv::COLOR_RGBA2GRAY);
+
+  // ---- Occlusion detection: skip frames with no texture (camera covered) ----
+  // Compute mean brightness of the grayscale frame.
+  // A mean < 10 (very dark) or > 245 (very bright/white) almost always means
+  // the lens is covered. Feeding such frames makes KLT tracking fail entirely,
+  // wasting a clone slot and leaving the filter relying purely on IMU.
+  cv::Scalar mean_val = cv::mean(mat_gray);
+  double mean_brightness = mean_val[0];
+  bool is_occluded = (mean_brightness < 10.0 || mean_brightness > 245.0);
+  if (is_occluded) {
+    // Set recovery counter so trajectory is suppressed for N frames after uncover
+    occlusion_recovery_counter.store(OCCLUSION_RECOVERY_FRAMES);
+    __android_log_print(ANDROID_LOG_WARN, TAG, "[OCCLUSION] Frame skipped: mean brightness=%.1f (lens likely covered)\n", mean_brightness);
+    return;
+  }
 
   // If recording save to disk 取消保存图片
   //  if (is_recording) {
