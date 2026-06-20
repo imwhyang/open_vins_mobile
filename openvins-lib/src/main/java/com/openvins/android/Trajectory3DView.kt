@@ -333,11 +333,11 @@ class TrajectoryRenderer(private val view: Trajectory3DView) : GLSurfaceView.Ren
         // For orthographic, zoom scales the bounds: zoom > 1 = zoomed out, zoom < 1 = zoomed in
         val orthoHeight = baseOrthoHeight / zoom
         val orthoWidth = baseOrthoWidth / zoom
-        Matrix.orthoM(projectionMatrix, 0, -orthoWidth, orthoWidth, -orthoHeight, orthoHeight, 0.1f, 150f)
+        Matrix.orthoM(projectionMatrix, 0, -orthoWidth, orthoWidth, -orthoHeight, orthoHeight, 0.1f, 100f)
         
         // Calculate camera position using spherical coordinates
         // Fixed distance from look-at point (orthographic doesn't use this for projection, but needed for view)
-        val fixedCameraDistance = 100f
+        val fixedCameraDistance = 50f
         
         // Convert angles to radians
         val elevationRad = Math.toRadians(elevation.toDouble())
@@ -913,7 +913,7 @@ class TrajectoryRenderer(private val view: Trajectory3DView) : GLSurfaceView.Ren
                         val distance = kotlin.math.sqrt(dx * dx + dy * dy)
                         // Pinching (decreasing distance) should zoom out
                         val delta = (distance - lastTouchDistance) * 0.01f
-                        zoom = (zoom + delta).coerceIn(0.5f, 50f)
+                        zoom = (zoom + delta).coerceIn(0.5f, 100f)
                         lastTouchDistance = distance
                     } else if (isRotating && pointerCount == 1) {
                         val dx = x0 - lastTouchX
