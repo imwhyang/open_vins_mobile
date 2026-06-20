@@ -333,11 +333,11 @@ class TrajectoryRenderer(private val view: Trajectory3DView) : GLSurfaceView.Ren
         // For orthographic, zoom scales the bounds: zoom > 1 = zoomed out, zoom < 1 = zoomed in
         val orthoHeight = baseOrthoHeight / zoom
         val orthoWidth = baseOrthoWidth / zoom
-        Matrix.orthoM(projectionMatrix, 0, -orthoWidth, orthoWidth, -orthoHeight, orthoHeight, 0.1f, 100f)
+        Matrix.orthoM(projectionMatrix, 0, -orthoWidth, orthoWidth, -orthoHeight, orthoHeight, 0.1f, 150f)
         
         // Calculate camera position using spherical coordinates
         // Fixed distance from look-at point (orthographic doesn't use this for projection, but needed for view)
-        val fixedCameraDistance = 50f
+        val fixedCameraDistance = 100f
         
         // Convert angles to radians
         val elevationRad = Math.toRadians(elevation.toDouble())
@@ -522,7 +522,7 @@ class TrajectoryRenderer(private val view: Trajectory3DView) : GLSurfaceView.Ren
                     val y = positions[i + 1]  // Right-handed Y (forward) -> OpenGL -Z
                     val z = positions[i + 2]  // Right-handed Z (up) -> OpenGL Y
                     convertedPositions[i] = x
-                    convertedPositions[i + 1] = z   // Z -> Y (up)
+                    convertedPositions[i + 1] = z / 10   // Z -> Y (up)
                     convertedPositions[i + 2] = -y  // Y -> -Z (forward into screen)
                 }
                 
@@ -564,7 +564,7 @@ class TrajectoryRenderer(private val view: Trajectory3DView) : GLSurfaceView.Ren
             if (currentPos.size >= 3) {
                 currentPosition = floatArrayOf(
                     currentPos[0],     // X
-                    currentPos[2],    // Z -> Y (up)
+                    currentPos[2] / 10,    // Z -> Y (up)
                     -currentPos[1]    // Y -> -Z (forward)
                 )
             } else {
