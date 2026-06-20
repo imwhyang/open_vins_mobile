@@ -521,9 +521,9 @@ class TrajectoryRenderer(private val view: Trajectory3DView) : GLSurfaceView.Ren
                     val x = positions[i]      // X stays same
                     val y = positions[i + 1]  // Right-handed Y (forward) -> OpenGL -Z
                     val z = positions[i + 2]  // Right-handed Z (up) -> OpenGL Y
-                    convertedPositions[i] = x
-                    convertedPositions[i + 1] = z / 10   // Z -> Y (up)
-                    convertedPositions[i + 2] = -y  // Y -> -Z (forward into screen)
+                    convertedPositions[i] = x / 3
+                    convertedPositions[i + 1] = z / 100   // Z -> Y (up)
+                    convertedPositions[i + 2] = -y / 3  // Y -> -Z (forward into screen)
                 }
                 
                 // Create trajectory buffer
@@ -563,9 +563,9 @@ class TrajectoryRenderer(private val view: Trajectory3DView) : GLSurfaceView.Ren
             // Convert current position from right-handed to OpenGL
             if (currentPos.size >= 3) {
                 currentPosition = floatArrayOf(
-                    currentPos[0],     // X
+                    currentPos[0] / 3,     // X
                     currentPos[2] / 10,    // Z -> Y (up)
-                    -currentPos[1]    // Y -> -Z (forward)
+                    -currentPos[1] / 3    // Y -> -Z (forward)
                 )
             } else {
                 currentPosition = currentPos.clone()
