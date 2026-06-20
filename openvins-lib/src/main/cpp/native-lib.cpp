@@ -85,15 +85,6 @@ const double MAX_CAMERA_AGE_SECONDS = 0.5; // Skip measurements older than 500ms
 // OPENVINS SPECIFIC VARS - END
 //=========================================================
 
-// Helper to safely get a local reference to the VIO system.
-// toggleSystemJNI/JNI_OnUnload can reset sys to nullptr while camera/IMU threads
-// are still running; copying the shared_ptr under camera_queue_mtx ensures the
-// VioManager stays alive for the duration of the caller's use.
-std::shared_ptr<ov_msckf::VioManager> get_safe_sys() {
-  std::lock_guard<std::mutex> lck(camera_queue_mtx);
-  return sys;
-}
-
 // Visualization data files
 double viz_rate = 30.0;
 double viz_time = -1.0;
@@ -177,18 +168,13 @@ void processing_worker_thread() {
       current_imu_timestamp = latest_imu_timestamp;
     }
 
-    // Safely obtain a local reference to the VIO system.
-    // This prevents use-after-free if toggleSystemJNI/JNI_OnUnload reset sys
-    // while this thread is still processing.
-    std::shared_ptr<ov_msckf::VioManager> local_sys = get_safe_sys();
-
     // Check if we have a valid system and IMU timestamp
-    if (local_sys == nullptr || current_imu_timestamp <= 0.0) {
+    if (sys == nullptr || current_imu_timestamp <= 0.0) {
       continue;
     }
 
-    // Calculate IMU timestamp in camera frame (outside lock since local_sys keeps object alive)
-    double timestamp_imu_inC = current_imu_timestamp - local_sys->get_state()->_calib_dt_CAMtoIMU->value()(0);
+    // Calculate IMU timestamp in camera frame (outside lock since sys is thread-safe)
+    double timestamp_imu_inC = current_imu_timestamp - sys->get_state()->_calib_dt_CAMtoIMU->value()(0);
 
     // Get current time in boot time reference (to match camera/IMU timestamps)
     // Use CLOCK_BOOTTIME to get nanoseconds since boot (same reference as camera/IMU)
@@ -248,13 +234,13 @@ void processing_worker_thread() {
       // Process this camera measurement (lock is released during this call)
       auto t_feed_start = boost::posix_time::microsec_clock::local_time();
       double update_dt = 100.0 * (timestamp_imu_inC - cam_msg.timestamp);
-      local_sys->feed_measurement_camera(cam_msg);
+      sys->feed_measurement_camera(cam_msg);
       auto t_feed_end = boost::posix_time::microsec_clock::local_time();
       double time_feed = (t_feed_end - t_feed_start).total_microseconds() * 1e-6;
 
       // Time state retrieval
       auto t_state_start = boost::posix_time::microsec_clock::local_time();
-      auto state = local_sys->get_state();
+      auto state = sys->get_state();
       auto q_GtoI = state->_imu->quat();
       auto p_IinG = state->_imu->pos();
 
@@ -283,7 +269,7 @@ void processing_worker_thread() {
       viz_track_last_time = current_time;
 
       // Display things if we have initialized
-      if (local_sys->initialized()) {
+      if (sys->initialized()) {
         // Store trajectory point (camera pose)
         // q_cam is JPL format [qx, qy, qz, qw], but TrajectoryPoint expects [qw, qx, qy, qz]
         std::lock_guard<std::mutex> traj_lck(trajectory_mtx);
@@ -609,11 +595,8 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_processYU
 // Get display image - returns raw camera if not running, or viz image with overlays if running
 extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_getDisplayImageJNI(JNIEnv *env, jobject clazz,
                                                                                           jlong rawCameraMatAddr) {
-  // Safely obtain a local reference to the VIO system.
-  std::shared_ptr<ov_msckf::VioManager> local_sys = get_safe_sys();
-
   // If not running, just return the raw camera image (converted to RGB)
-  if (!is_running_ov || local_sys == nullptr) {
+  if (!is_running_ov || sys == nullptr) {
     if (rawCameraMatAddr == 0) {
       return 0;
     }
@@ -626,7 +609,7 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_getDispla
   }
 
   // System is running - get visualization image with overlays
-  cv::Mat viz_img = local_sys->get_historical_viz_image();
+  cv::Mat viz_img = sys->get_historical_viz_image();
   if (viz_img.empty()) {
     // Fallback to raw camera if no viz image
     if (rawCameraMatAddr != 0) {
@@ -655,7 +638,7 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_getDispla
   const int font_thickness = 1;
   const int line_spacing = 18; // Spacing between lines in pixels
 
-  if (!viz_state1.empty()) {
+  if (sys != nullptr && !viz_state1.empty()) {
     int y_start = displayMat->rows - (line_spacing * 3); // Start 3 lines from bottom
     cv::Point point1(10, y_start);
     cv::putText(*displayMat, viz_state1, point1, cv::FONT_HERSHEY_COMPLEX_SMALL, font_scale, cv::Scalar(255, 0, 0), font_thickness);
@@ -710,11 +693,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIma
     return;
   }
 
-  // Safely obtain a local reference to the VIO system.
-  std::shared_ptr<ov_msckf::VioManager> local_sys = get_safe_sys();
-
   // Construct our tracker object if needed
-  if (is_running_ov && local_sys == nullptr) {
+  if (is_running_ov && sys == nullptr) {
 
     // Log level
     ov_core::Printer::setPrintLevel(ov_core::Printer::PrintLevel::ALL);
@@ -765,22 +745,17 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIma
       return;
     } else {
       std::lock_guard<std::mutex> lck(camera_queue_mtx);
-      // Double-check: only create if VIO is still enabled and sys is still null.
-      // toggleSystemJNI(false) may have run while we parsed config.
-      if (is_running_ov && sys == nullptr) {
-        sys = std::make_shared<ov_msckf::VioManager>(params);
-      }
-      local_sys = sys;
+      sys = std::make_shared<ov_msckf::VioManager>(params);
     }
   }
 
   // Try to process the image, check if we should drop this image
   // We will append this image to the queue if we need to
-  if (local_sys != nullptr) {
+  if (sys != nullptr) {
 
     // See if the message should be dropped / skipped
     int cam_id0 = 0;
-    double time_delta = 1.0 / local_sys->get_params().track_frequency;
+    double time_delta = 1.0 / sys->get_params().track_frequency;
     bool should_queue =
         camera_last_timestamp.find(cam_id0) == camera_last_timestamp.end() || time_in_sec > camera_last_timestamp.at(cam_id0) + time_delta;
 
@@ -850,8 +825,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIma
   // This is separate from the actual processing - just updating the cache
   if (viz_time == -1 || (time_in_sec - viz_time) > 1.0 / viz_rate) {
     cv::Mat temp_img;
-    if (local_sys != nullptr) {
-      temp_img = local_sys->get_historical_viz_image();
+    if (sys != nullptr) {
+      temp_img = sys->get_historical_viz_image();
     }
     if (!temp_img.empty()) {
       viz_image = temp_img.clone();
@@ -883,18 +858,15 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIne
     //    __android_log_print(ANDROID_LOG_INFO, TAG, "%.4f, %.4f, %.4f | %.4f, %.4f, %.4f \n", n_ax, n_ay, n_az, n_gx, n_gy, n_gz);
   }
 
-  // Safely obtain a local reference to the VIO system.
-  std::shared_ptr<ov_msckf::VioManager> local_sys = get_safe_sys();
-
   // Feed if the system is running!
-  if (local_sys != nullptr) {
+  if (sys != nullptr) {
 
     // Send it into the system
     ov_core::ImuData message_imu;
     message_imu.timestamp = time_in_sec;
     message_imu.wm << n_gx, n_gy, n_gz;
     message_imu.am << n_ax, n_ay, n_az;
-    local_sys->feed_measurement_imu(message_imu);
+    sys->feed_measurement_imu(message_imu);
 
     // Update the latest IMU timestamp (worker thread will poll for this)
     {
@@ -908,13 +880,11 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIne
 extern "C" JNIEXPORT jboolean JNICALL Java_com_openvins_android_VioEngine_getCurrentPoseJNI(JNIEnv *env, jobject instance,
                                                                                             jdoubleArray position,
                                                                                             jdoubleArray quaternion) {
-  // Safely obtain a local reference to the VIO system.
-  std::shared_ptr<ov_msckf::VioManager> local_sys = get_safe_sys();
-  if (local_sys == nullptr || !is_running_ov) {
+  if (sys == nullptr || !is_running_ov) {
     return JNI_FALSE;
   }
 
-  auto state = local_sys->get_state();
+  auto state = sys->get_state();
   if (state == nullptr) {
     return JNI_FALSE;
   }

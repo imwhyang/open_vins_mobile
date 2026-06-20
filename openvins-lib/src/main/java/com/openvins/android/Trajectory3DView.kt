@@ -280,65 +280,49 @@ class TrajectoryRenderer(private val view: Trajectory3DView) : GLSurfaceView.Ren
         // Fully transparent background
         GLES20.glClearColor(0.0f, 0.0f, 0.0f, 0.0f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
-
+        
         // Check for OpenGL errors
         var error = GLES20.glGetError()
         if (error != GLES20.GL_NO_ERROR) {
             android.util.Log.e("Trajectory3D", "OpenGL error before drawing: $error")
         }
-
-        // Snapshot all trajectory/frustum state under the same lock used by updateTrajectory()
-        // to avoid reading a point count from an old buffer while using a newly swapped buffer.
-        val localTrajectoryPointCount: Int
-        val localTrajectoryBuffer: FloatBuffer?
-        val localTrajectoryColorBuffer: FloatBuffer?
-        val localFrustumBuffer: FloatBuffer?
-        val localFrustumColorBuffer: FloatBuffer?
-        synchronized(this) {
-            localTrajectoryPointCount = trajectoryPointCount
-            localTrajectoryBuffer = trajectoryBuffer
-            localTrajectoryColorBuffer = trajectoryColorBuffer
-            localFrustumBuffer = frustumBuffer
-            localFrustumColorBuffer = frustumColorBuffer
-        }
-
+        
         // Log rendering state periodically (every 60 frames)
         frameCount++
         if (frameCount % 60 == 0) {
-            android.util.Log.d("Trajectory3D", "Rendering frame: grid=$gridLineCount lines, axes=ready, trajectory=$localTrajectoryPointCount points")
+            android.util.Log.d("Trajectory3D", "Rendering frame: grid=$gridLineCount lines, axes=ready, trajectory=$trajectoryPointCount points")
         }
-
+        
         // Constrain elevation to prevent going below XY plane (looking upward)
         // elevation: 0 = straight down from above, 90 = horizontal (camera at same height as look-at)
         elevation = elevation.coerceIn(0f, 90f)
-
+        
         // Update view matrix based on camera controls
         // OpenGL uses left-handed coordinate system
         // OpenGL: X=right, Y=up, Z=forward (into screen, positive Z is away)
         // Right-handed trajectory: X=right, Y=forward, Z=up
         // Conversion already done: OpenGL_X = Right_X, OpenGL_Y = Right_Z, OpenGL_Z = -Right_Y
-
+        
         Matrix.setIdentityM(viewMatrix, 0)
-
+        
         // Calculate center point to look at (origin or trajectory center)
         var lookAtX = 0f
         var lookAtY = 0f  // OpenGL Y (up) - should stay at 0 for grid plane
         var lookAtZ = 0f  // OpenGL Z
-
+        
         // If we have trajectory data, center on trajectory
-        if (localTrajectoryPointCount > 0 && localTrajectoryBuffer != null) {
-            val buffer = localTrajectoryBuffer
-            // localTrajectoryPointCount and localTrajectoryBuffer are captured together under lock,
-            // so they are guaranteed to be consistent.
-            for (i in 0 until localTrajectoryPointCount) {
+        if (trajectoryPointCount > 0 && trajectoryBuffer != null) {
+            val buffer = trajectoryBuffer!!
+            // trajectoryPointCount is calculated from buffer capacity, so it should be safe
+            for (i in 0 until trajectoryPointCount) {
                 val baseIdx = i * 3
                 lookAtX += buffer.get(baseIdx)
                 lookAtY += buffer.get(baseIdx + 1)
                 lookAtZ += buffer.get(baseIdx + 2)
             }
-            lookAtX /= localTrajectoryPointCount
-            lookAtY /= localTrajectoryPointCount
-            lookAtZ /= localTrajectoryPointCount
+            lookAtX /= trajectoryPointCount
+            lookAtY /= trajectoryPointCount
+            lookAtZ /= trajectoryPointCount
         }
         
         // Apply translation
@@ -408,61 +392,62 @@ class TrajectoryRenderer(private val view: Trajectory3DView) : GLSurfaceView.Ren
         // ALWAYS draw grid and axes - these should always be visible
         drawGrid()
         drawAxes()
-
+        
         // Draw trajectory and frustum only if we have data
-        if (localTrajectoryPointCount > 0) {
-            drawTrajectory(localTrajectoryPointCount, localTrajectoryBuffer, localTrajectoryColorBuffer)
-            drawCameraFrustum(localFrustumBuffer, localFrustumColorBuffer)
+        if (trajectoryPointCount > 0) {
+            drawTrajectory()
+            drawCameraFrustum()
         }
 
         // 渲染完成后检查是否有待执行的图片捕获
         view.performCaptureIfPending(viewportWidth, viewportHeight)
     }
     
-    private fun drawTrajectory(pointCount: Int, positionBuffer: FloatBuffer?, colorBuffer: FloatBuffer?) {
-        if (pointCount < 2 || positionBuffer == null || colorBuffer == null) return
-
+    private fun drawTrajectory() {
+        if (trajectoryPointCount < 2 || trajectoryBuffer == null) return
+        
+        // trajectoryPointCount is calculated from buffer capacity, so it should be safe
         GLES20.glUseProgram(trajectoryProgram)
-
+        
         val positionHandle = GLES20.glGetAttribLocation(trajectoryProgram, "vPosition")
         val colorHandle = GLES20.glGetAttribLocation(trajectoryProgram, "vColor")
         val mvpHandle = GLES20.glGetUniformLocation(trajectoryProgram, "uMVPMatrix")
-
+        
         GLES20.glUniformMatrix4fv(mvpHandle, 1, false, mvpMatrix, 0)
-
+        
         GLES20.glEnableVertexAttribArray(positionHandle)
-        GLES20.glVertexAttribPointer(positionHandle, 3, GLES20.GL_FLOAT, false, 0, positionBuffer)
-
+        GLES20.glVertexAttribPointer(positionHandle, 3, GLES20.GL_FLOAT, false, 0, trajectoryBuffer)
+        
         GLES20.glEnableVertexAttribArray(colorHandle)
-        GLES20.glVertexAttribPointer(colorHandle, 4, GLES20.GL_FLOAT, false, 0, colorBuffer)
-
+        GLES20.glVertexAttribPointer(colorHandle, 4, GLES20.GL_FLOAT, false, 0, trajectoryColorBuffer)
+        
         GLES20.glLineWidth(trajectoryLineWidth)
-        GLES20.glDrawArrays(GLES20.GL_LINE_STRIP, 0, pointCount)
-
+        GLES20.glDrawArrays(GLES20.GL_LINE_STRIP, 0, trajectoryPointCount)
+        
         GLES20.glDisableVertexAttribArray(positionHandle)
         GLES20.glDisableVertexAttribArray(colorHandle)
     }
-
-    private fun drawCameraFrustum(positionBuffer: FloatBuffer?, colorBuffer: FloatBuffer?) {
-        if (positionBuffer == null || colorBuffer == null) return
-
+    
+    private fun drawCameraFrustum() {
+        if (frustumBuffer == null) return
+        
         GLES20.glUseProgram(frustumProgram)
-
+        
         val positionHandle = GLES20.glGetAttribLocation(frustumProgram, "vPosition")
         val colorHandle = GLES20.glGetAttribLocation(frustumProgram, "vColor")
         val mvpHandle = GLES20.glGetUniformLocation(frustumProgram, "uMVPMatrix")
-
+        
         GLES20.glUniformMatrix4fv(mvpHandle, 1, false, mvpMatrix, 0)
-
+        
         GLES20.glEnableVertexAttribArray(positionHandle)
-        GLES20.glVertexAttribPointer(positionHandle, 3, GLES20.GL_FLOAT, false, 0, positionBuffer)
-
+        GLES20.glVertexAttribPointer(positionHandle, 3, GLES20.GL_FLOAT, false, 0, frustumBuffer)
+        
         GLES20.glEnableVertexAttribArray(colorHandle)
-        GLES20.glVertexAttribPointer(colorHandle, 4, GLES20.GL_FLOAT, false, 0, colorBuffer)
-
+        GLES20.glVertexAttribPointer(colorHandle, 4, GLES20.GL_FLOAT, false, 0, frustumColorBuffer)
+        
         GLES20.glLineWidth(2f)
         GLES20.glDrawArrays(GLES20.GL_LINES, 0, 24) // Camera frustum has 24 lines
-
+        
         GLES20.glDisableVertexAttribArray(positionHandle)
         GLES20.glDisableVertexAttribArray(colorHandle)
     }
