@@ -555,7 +555,7 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
             var bestDiff = Integer.MAX_VALUE
             for (size in sizes) {
                 val diff = Math.abs(size.width - width) + Math.abs(size.height - height)
-                if (diff < bestDiff && size.width <= 640 && size.height <= 480) {
+                if (diff < bestDiff && size.width <= 800 && size.height <= 640) {
                     bestDiff = diff
                     bestSize = size
                 }
