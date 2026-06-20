@@ -913,7 +913,7 @@ class TrajectoryRenderer(private val view: Trajectory3DView) : GLSurfaceView.Ren
                         val distance = kotlin.math.sqrt(dx * dx + dy * dy)
                         // Pinching (decreasing distance) should zoom out
                         val delta = (distance - lastTouchDistance) * 0.01f
-                        zoom = (zoom + delta).coerceIn(0.5f, 50f)
+                        zoom = (zoom + delta).coerceIn(0.5f, 100f)
                         lastTouchDistance = distance
                     } else if (isRotating && pointerCount == 1) {
                         val dx = x0 - lastTouchX
