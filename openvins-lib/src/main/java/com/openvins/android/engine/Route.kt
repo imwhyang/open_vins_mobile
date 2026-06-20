@@ -1,8 +1,6 @@
 package com.openvins.android.engine
 
 import glm_.vec3.Vec3d
-import kotlin.math.max
-import kotlin.math.min
 
 object Route {
     /*
@@ -19,19 +17,6 @@ object Route {
             sum += Utils.distancePointToPoint(path[i], path[i + 1])
         }
         return sum
-    }
-
-    fun calculateMovingSpacing(path: List<Vec3d>): Double {
-        if (path.size < 2) return 0.0
-        val minSpacing = doubleArrayOf(1000000.0, 1000000.0)
-        val maxSpacing = doubleArrayOf(-1000000.0, -1000000.0)
-        for (i in path.indices) {
-            minSpacing[0] = min(minSpacing[0], path[i].x)
-            minSpacing[1] = min(minSpacing[1], path[i].y)
-            maxSpacing[0] = max(maxSpacing[0], path[i].x)
-            maxSpacing[1] = max(maxSpacing[1], path[i].y)
-        }
-        return Utils.distancePointToPoint(minSpacing, maxSpacing)
     }
 
     /*

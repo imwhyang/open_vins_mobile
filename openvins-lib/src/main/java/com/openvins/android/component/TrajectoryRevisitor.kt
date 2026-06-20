@@ -81,11 +81,6 @@ class TrajectoryRevisitor {
         if (tmpMileage < threshold || tmpOuterMileage < threshold) {
             return Result(false, 1.0, 0.0)
         }
-        val tmpSpacing = Route.calculateMovingSpacing(trajectory.points)
-        val tmpOuterSpacing = Route.calculateMovingSpacing(outerTrajectory.points)
-        if (tmpSpacing < _maxDistance || tmpOuterSpacing < _maxDistance) {
-            return Result(false, 1.1, 0.0)
-        }
 
         val tripleRange0 =
             Route.getMinimumSubPathReversed(trajectory.points, _revisitMileage, _maxDistance)
