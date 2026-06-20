@@ -522,7 +522,7 @@ class TrajectoryRenderer(private val view: Trajectory3DView) : GLSurfaceView.Ren
                     val y = positions[i + 1]  // Right-handed Y (forward) -> OpenGL -Z
                     val z = positions[i + 2]  // Right-handed Z (up) -> OpenGL Y
                     convertedPositions[i] = x
-                    convertedPositions[i + 1] = z   // Z -> Y (up)
+                    convertedPositions[i + 1] = z / 10   // Z -> Y (up)
                     convertedPositions[i + 2] = -y  // Y -> -Z (forward into screen)
                 }
                 
@@ -564,7 +564,7 @@ class TrajectoryRenderer(private val view: Trajectory3DView) : GLSurfaceView.Ren
             if (currentPos.size >= 3) {
                 currentPosition = floatArrayOf(
                     currentPos[0],     // X
-                    currentPos[2],    // Z -> Y (up)
+                    currentPos[2] / 10,    // Z -> Y (up)
                     -currentPos[1]    // Y -> -Z (forward)
                 )
             } else {
@@ -913,7 +913,7 @@ class TrajectoryRenderer(private val view: Trajectory3DView) : GLSurfaceView.Ren
                         val distance = kotlin.math.sqrt(dx * dx + dy * dy)
                         // Pinching (decreasing distance) should zoom out
                         val delta = (distance - lastTouchDistance) * 0.01f
-                        zoom = (zoom + delta).coerceIn(0.5f, 50f)
+                        zoom = (zoom + delta).coerceIn(0.5f, 100f)
                         lastTouchDistance = distance
                     } else if (isRotating && pointerCount == 1) {
                         val dx = x0 - lastTouchX
