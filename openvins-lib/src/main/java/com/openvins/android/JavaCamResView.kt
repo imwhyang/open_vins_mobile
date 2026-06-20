@@ -12,7 +12,7 @@ class JavaCamResView(context: Context?, attrs: AttributeSet?) : JavaCameraView(c
     override fun initializeCamera(width: Int, height: Int): Boolean {
 
         // Set the max frame size
-        super.setMaxFrameSize(640, 480)
+        super.setMaxFrameSize(720, 540)
 
         // Initialize our camera
         if (!super.initializeCamera(width, height)) {
