@@ -4,7 +4,9 @@ import glm_.quat.QuatD
 import glm_.vec3.Vec3d
 
 data class Result(
-    val isRevisit: Boolean,
+    val isRevisit: Boolean = false,
+    val isRetrieve: Boolean = false,
+    val isDuplicated: Boolean = false,
     val impact: Double = 0.0,
     val outerImpact: Double = 0.0,
     val absPoseErrRotFro: Double = 0.0,
