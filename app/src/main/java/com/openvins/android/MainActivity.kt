@@ -29,6 +29,7 @@ import java.io.File
 import android.os.Handler
 import android.os.Looper
 import android.widget.Button
+import android.widget.RelativeLayout
 import android.widget.TextView
 import androidx.core.content.ContextCompat
 import com.openvins.android.component.TrajectoryRevisitor
@@ -182,6 +183,8 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
                 reset.setImageResource(R.drawable.ic_stop_system)
                 // Clear trajectory view when starting (in case there was leftover data)
                 trajectoryView?.clearTrajectory()
+                candidateTranslations.clear()
+                candidateQuaternions.clear()
                 val stopRecording = mOpenCvCameraView!!.stopRecording()
                 Log.d(TAG, "Stopped recording: $stopRecording")
                 true
@@ -496,19 +499,30 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
             currentQuat
         )
         tvPose?.text = String.format(
-            "Pose: currPosFloats: %f %f %f  isRevisit %b",
-            currPosFloats[0],
-            currPosFloats[1],
-            currPosFloats[2],
-            result.isRevisit
+            "%d %b %b (%.3f %.3f %.3f %.3f)",
+            candidateQuaternions.size,
+            result.isRetrieve,
+            result.isDuplicated,
+            result.impact,
+            result.outerImpact,
+            result.absPoseErrRotFro,
+            result.pointDistance,
         )
-        if (result.isRevisit) {
+        val params = RelativeLayout.LayoutParams(
+            RelativeLayout.LayoutParams.WRAP_CONTENT,
+            RelativeLayout.LayoutParams.WRAP_CONTENT
+        )
+        params.setMargins(200, 100, 0, 0)
+        tvPose?.layoutParams = params
+        if (result.isRetrieve) {
             tvPose?.setTextColor(ContextCompat.getColor(this, R.color.red))
+        } else if (result.isDuplicated) {
+            tvPose?.setTextColor(ContextCompat.getColor(this, R.color.teal_700))
         } else {
             tvPose?.setTextColor(ContextCompat.getColor(this, R.color.white))
-            candidateTranslations.add(currentPos)
-            candidateQuaternions.add(currentQuat)
         }
+        candidateTranslations.add(currentPos)
+        candidateQuaternions.add(currentQuat)
 
     }
 

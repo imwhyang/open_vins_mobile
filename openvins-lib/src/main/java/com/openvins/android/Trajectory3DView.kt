@@ -564,7 +564,7 @@ class TrajectoryRenderer(private val view: Trajectory3DView) : GLSurfaceView.Ren
             if (currentPos.size >= 3) {
                 currentPosition = floatArrayOf(
                     currentPos[0] / 3,     // X
-                    currentPos[2] / 10,    // Z -> Y (up)
+                    currentPos[2] / 100,    // Z -> Y (up)
                     -currentPos[1] / 3    // Y -> -Z (forward)
                 )
             } else {
