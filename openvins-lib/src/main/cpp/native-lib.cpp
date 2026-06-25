@@ -1,7 +1,9 @@
 #include <atomic>
 #include <cassert>
 #include <condition_variable>
+#include <cmath>
 #include <errno.h>
+#include <exception>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -56,6 +58,7 @@ std::mutex pose_ext_csv_mtx;
 
 // Master VIO system :)
 std::shared_ptr<ov_msckf::VioManager> sys = nullptr;
+std::mutex sys_mtx;
 
 // Persistent worker thread for processing camera measurements
 std::thread processing_thread;
@@ -66,7 +69,27 @@ std::condition_variable processing_cv;
 
 // Latest IMU timestamp (for determining which camera measurements can be processed)
 double latest_imu_timestamp = 0.0;
+double last_accepted_imu_timestamp = 0.0;
+size_t accepted_imu_count = 0;
 std::mutex imu_timestamp_mtx;
+
+// Android IMU can occasionally emit large one-frame spikes. OpenVINS expects
+// raw accelerometer readings including gravity, so keep normal ~9.81m/s^2 data
+// and only suppress physically implausible glitches before propagation.
+const double MAX_ACCEL_NORM = 60.0;      // m/s^2, about 6g including gravity.
+const double MAX_GYRO_NORM = 20.0;       // rad/s, far above normal handheld motion.
+const double MAX_ACCEL_JUMP = 35.0;      // m/s^2 jump between adjacent FASTEST samples.
+const double MAX_GYRO_JUMP = 8.0;        // rad/s jump between adjacent FASTEST samples.
+const double IMU_FILTER_RESET_DT = 0.25; // seconds; reset filter after long gaps.
+bool imu_filter_initialized = false;
+double last_valid_imu_timestamp = 0.0;
+double last_valid_ax = 0.0;
+double last_valid_ay = 0.0;
+double last_valid_az = 9.81;
+double last_valid_gx = 0.0;
+double last_valid_gy = 0.0;
+double last_valid_gz = 0.0;
+std::mutex imu_filter_mtx;
 
 // Queue up camera measurements sorted by time and trigger once we have
 // exactly one IMU measurement with timestamp newer than the camera measurement
@@ -126,8 +149,11 @@ JNIEXPORT void JNICALL JNI_OnUnload(JavaVM *vm, void *reserved) {
 
   // Clean up VIO system
   {
-    std::lock_guard<std::mutex> lck(camera_queue_mtx);
+    std::lock_guard<std::mutex> sys_lck(sys_mtx);
     sys = nullptr;
+  }
+  {
+    std::lock_guard<std::mutex> lck(camera_queue_mtx);
     camera_queue.clear();
     camera_last_timestamp.clear();
   }
@@ -146,7 +172,6 @@ JNIEXPORT void JNICALL JNI_OnUnload(JavaVM *vm, void *reserved) {
 // Worker thread function that continuously processes camera measurements
 void processing_worker_thread() {
   __android_log_print(ANDROID_LOG_INFO, TAG, "Processing worker thread started\n");
-  thread_running = true;
 
   while (thread_should_run) {
     {
@@ -168,13 +193,25 @@ void processing_worker_thread() {
       current_imu_timestamp = latest_imu_timestamp;
     }
 
-    // Check if we have a valid system and IMU timestamp
-    if (sys == nullptr || current_imu_timestamp <= 0.0) {
+    size_t current_imu_count;
+    {
+      std::lock_guard<std::mutex> imu_lck(imu_timestamp_mtx);
+      current_imu_count = accepted_imu_count;
+    }
+
+    std::shared_ptr<ov_msckf::VioManager> local_sys;
+    {
+      std::lock_guard<std::mutex> sys_lck(sys_mtx);
+      local_sys = sys;
+    }
+
+    // Check if we have a valid system and enough IMU data to propagate safely.
+    if (local_sys == nullptr || current_imu_timestamp <= 0.0 || current_imu_count < 5) {
       continue;
     }
 
     // Calculate IMU timestamp in camera frame (outside lock since sys is thread-safe)
-    double timestamp_imu_inC = current_imu_timestamp - sys->get_state()->_calib_dt_CAMtoIMU->value()(0);
+    double timestamp_imu_inC = current_imu_timestamp - local_sys->get_state()->_calib_dt_CAMtoIMU->value()(0);
 
     // Get current time in boot time reference (to match camera/IMU timestamps)
     // Use CLOCK_BOOTTIME to get nanoseconds since boot (same reference as camera/IMU)
@@ -234,13 +271,24 @@ void processing_worker_thread() {
       // Process this camera measurement (lock is released during this call)
       auto t_feed_start = boost::posix_time::microsec_clock::local_time();
       double update_dt = 100.0 * (timestamp_imu_inC - cam_msg.timestamp);
-      sys->feed_measurement_camera(cam_msg);
+      if (!thread_should_run) {
+        break;
+      }
+      try {
+        local_sys->feed_measurement_camera(cam_msg);
+      } catch (const std::exception &e) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "feed_measurement_camera exception: %s\n", e.what());
+        continue;
+      } catch (...) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "feed_measurement_camera unknown exception\n");
+        continue;
+      }
       auto t_feed_end = boost::posix_time::microsec_clock::local_time();
       double time_feed = (t_feed_end - t_feed_start).total_microseconds() * 1e-6;
 
       // Time state retrieval
       auto t_state_start = boost::posix_time::microsec_clock::local_time();
-      auto state = sys->get_state();
+      auto state = local_sys->get_state();
       auto q_GtoI = state->_imu->quat();
       auto p_IinG = state->_imu->pos();
 
@@ -269,7 +317,7 @@ void processing_worker_thread() {
       viz_track_last_time = current_time;
 
       // Display things if we have initialized
-      if (sys->initialized()) {
+      if (local_sys->initialized()) {
         // Store trajectory point (camera pose)
         // q_cam is JPL format [qx, qy, qz, qw], but TrajectoryPoint expects [qw, qx, qy, qz]
         std::lock_guard<std::mutex> traj_lck(trajectory_mtx);
@@ -398,8 +446,11 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_toggleSyst
     // Set sys to nullptr - this signals shutdown to all threads
     // Shared_ptr will automatically destroy VioManager when last reference is released
     {
-      std::lock_guard<std::mutex> lck(camera_queue_mtx);
+      std::lock_guard<std::mutex> sys_lck(sys_mtx);
       sys = nullptr;
+    }
+    {
+      std::lock_guard<std::mutex> lck(camera_queue_mtx);
       // Clear queues immediately
       camera_queue.clear();
       camera_last_timestamp.clear();
@@ -409,6 +460,19 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_toggleSyst
     {
       std::lock_guard<std::mutex> imu_lck(imu_timestamp_mtx);
       latest_imu_timestamp = 0.0;
+      last_accepted_imu_timestamp = 0.0;
+      accepted_imu_count = 0;
+    }
+    {
+      std::lock_guard<std::mutex> filter_lck(imu_filter_mtx);
+      imu_filter_initialized = false;
+      last_valid_imu_timestamp = 0.0;
+      last_valid_ax = 0.0;
+      last_valid_ay = 0.0;
+      last_valid_az = 9.81;
+      last_valid_gx = 0.0;
+      last_valid_gy = 0.0;
+      last_valid_gz = 0.0;
     }
 
     // Reset visualization state
@@ -439,6 +503,19 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_toggleSyst
     {
       std::lock_guard<std::mutex> imu_lck(imu_timestamp_mtx);
       latest_imu_timestamp = 0.0;
+      last_accepted_imu_timestamp = 0.0;
+      accepted_imu_count = 0;
+    }
+    {
+      std::lock_guard<std::mutex> filter_lck(imu_filter_mtx);
+      imu_filter_initialized = false;
+      last_valid_imu_timestamp = 0.0;
+      last_valid_ax = 0.0;
+      last_valid_ay = 0.0;
+      last_valid_az = 9.81;
+      last_valid_gx = 0.0;
+      last_valid_gy = 0.0;
+      last_valid_gz = 0.0;
     }
 
     // Reset visualization state
@@ -452,6 +529,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_toggleSyst
     // Start the worker thread
     if (!thread_running) {
       thread_should_run = true;
+      thread_running = true;
       processing_thread = std::thread(processing_worker_thread);
       __android_log_print(ANDROID_LOG_INFO, TAG, "Processing worker thread started\n");
     }
@@ -595,8 +673,14 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_processYU
 // Get display image - returns raw camera if not running, or viz image with overlays if running
 extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_getDisplayImageJNI(JNIEnv *env, jobject clazz,
                                                                                           jlong rawCameraMatAddr) {
+  std::shared_ptr<ov_msckf::VioManager> local_sys;
+  {
+    std::lock_guard<std::mutex> sys_lck(sys_mtx);
+    local_sys = sys;
+  }
+
   // If not running, just return the raw camera image (converted to RGB)
-  if (!is_running_ov || sys == nullptr) {
+  if (!is_running_ov || local_sys == nullptr) {
     if (rawCameraMatAddr == 0) {
       return 0;
     }
@@ -609,7 +693,7 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_getDispla
   }
 
   // System is running - get visualization image with overlays
-  cv::Mat viz_img = sys->get_historical_viz_image();
+  cv::Mat viz_img = local_sys->get_historical_viz_image();
   if (viz_img.empty()) {
     // Fallback to raw camera if no viz image
     if (rawCameraMatAddr != 0) {
@@ -638,7 +722,7 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_getDispla
   const int font_thickness = 1;
   const int line_spacing = 18; // Spacing between lines in pixels
 
-  if (sys != nullptr && !viz_state1.empty()) {
+  if (local_sys != nullptr && !viz_state1.empty()) {
     int y_start = displayMat->rows - (line_spacing * 3); // Start 3 lines from bottom
     cv::Point point1(10, y_start);
     cv::putText(*displayMat, viz_state1, point1, cv::FONT_HERSHEY_COMPLEX_SMALL, font_scale, cv::Scalar(255, 0, 0), font_thickness);
@@ -694,7 +778,13 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIma
   }
 
   // Construct our tracker object if needed
-  if (is_running_ov && sys == nullptr) {
+  std::shared_ptr<ov_msckf::VioManager> local_sys;
+  {
+    std::lock_guard<std::mutex> sys_lck(sys_mtx);
+    local_sys = sys;
+  }
+
+  if (is_running_ov && local_sys == nullptr) {
 
     // Log level
     ov_core::Printer::setPrintLevel(ov_core::Printer::PrintLevel::ALL);
@@ -744,28 +834,34 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIma
       __android_log_print(ANDROID_LOG_ERROR, TAG, "unable to parse all parameters, please fix!!!");
       return;
     } else {
-      std::lock_guard<std::mutex> lck(camera_queue_mtx);
-      sys = std::make_shared<ov_msckf::VioManager>(params);
+      local_sys = std::make_shared<ov_msckf::VioManager>(params);
+      std::lock_guard<std::mutex> sys_lck(sys_mtx);
+      sys = local_sys;
     }
   }
 
   // Try to process the image, check if we should drop this image
   // We will append this image to the queue if we need to
-  if (sys != nullptr) {
+  if (local_sys != nullptr && is_running_ov) {
 
     // See if the message should be dropped / skipped
     int cam_id0 = 0;
-    double time_delta = 1.0 / sys->get_params().track_frequency;
-    bool should_queue =
-        camera_last_timestamp.find(cam_id0) == camera_last_timestamp.end() || time_in_sec > camera_last_timestamp.at(cam_id0) + time_delta;
-
-    // Calculate inter-frame interval for logging
+    double time_delta = 1.0 / local_sys->get_params().track_frequency;
+    bool should_queue = false;
     double frame_delta = 0.0;
     double expected_frame_rate = 0.0;
-    if (camera_last_timestamp.find(cam_id0) != camera_last_timestamp.end()) {
-      frame_delta = time_in_sec - camera_last_timestamp.at(cam_id0);
-      if (frame_delta > 0.0) {
-        expected_frame_rate = 1.0 / frame_delta;
+    {
+      std::lock_guard<std::mutex> lck(camera_queue_mtx);
+      auto last_it = camera_last_timestamp.find(cam_id0);
+      should_queue = last_it == camera_last_timestamp.end() || time_in_sec > last_it->second + time_delta;
+      if (last_it != camera_last_timestamp.end()) {
+        frame_delta = time_in_sec - last_it->second;
+        if (frame_delta > 0.0) {
+          expected_frame_rate = 1.0 / frame_delta;
+        }
+      }
+      if (should_queue) {
+        camera_last_timestamp[cam_id0] = time_in_sec;
       }
     }
 
@@ -776,9 +872,6 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIma
     }
 
     if (should_queue) {
-
-      // Record the time we will append the queue
-      camera_last_timestamp[cam_id0] = time_in_sec;
 
       // Create the measurement
       ov_core::CameraData message;
@@ -823,10 +916,10 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIma
 
   // Update visualization image cache (used by getDisplayImageJNI for overlays)
   // This is separate from the actual processing - just updating the cache
-  if (viz_time == -1 || (time_in_sec - viz_time) > 1.0 / viz_rate) {
+    if (viz_time == -1 || (time_in_sec - viz_time) > 1.0 / viz_rate) {
     cv::Mat temp_img;
-    if (sys != nullptr) {
-      temp_img = sys->get_historical_viz_image();
+    if (local_sys != nullptr) {
+      temp_img = local_sys->get_historical_viz_image();
     }
     if (!temp_img.empty()) {
       viz_image = temp_img.clone();
@@ -852,26 +945,101 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIne
   double n_gy = static_cast<double>(gy);
   double n_gz = static_cast<double>(gz);
 
+  bool imu_sample_valid = true;
+  {
+    std::lock_guard<std::mutex> filter_lck(imu_filter_mtx);
+    const double accel_norm = std::sqrt(n_ax * n_ax + n_ay * n_ay + n_az * n_az);
+    const double gyro_norm = std::sqrt(n_gx * n_gx + n_gy * n_gy + n_gz * n_gz);
+    const bool finite_sample = std::isfinite(time_in_sec) && std::isfinite(accel_norm) && std::isfinite(gyro_norm);
+    const double dt = imu_filter_initialized ? time_in_sec - last_valid_imu_timestamp : 0.0;
+
+    bool hard_spike = !finite_sample || accel_norm > MAX_ACCEL_NORM || gyro_norm > MAX_GYRO_NORM;
+    bool jump_spike = false;
+    if (imu_filter_initialized && dt > 0.0 && dt < IMU_FILTER_RESET_DT) {
+      const double dax = n_ax - last_valid_ax;
+      const double day = n_ay - last_valid_ay;
+      const double daz = n_az - last_valid_az;
+      const double dgx = n_gx - last_valid_gx;
+      const double dgy = n_gy - last_valid_gy;
+      const double dgz = n_gz - last_valid_gz;
+      const double accel_jump = std::sqrt(dax * dax + day * day + daz * daz);
+      const double gyro_jump = std::sqrt(dgx * dgx + dgy * dgy + dgz * dgz);
+      jump_spike = accel_jump > MAX_ACCEL_JUMP || gyro_jump > MAX_GYRO_JUMP;
+    }
+
+    if (hard_spike || jump_spike) {
+      if (imu_filter_initialized && dt > 0.0 && dt < IMU_FILTER_RESET_DT) {
+        __android_log_print(ANDROID_LOG_WARN, TAG,
+                            "Replacing IMU spike at %.9f: acc_norm=%.3f gyro_norm=%.3f hard=%d jump=%d\n", time_in_sec, accel_norm,
+                            gyro_norm, hard_spike ? 1 : 0, jump_spike ? 1 : 0);
+        n_ax = last_valid_ax;
+        n_ay = last_valid_ay;
+        n_az = last_valid_az;
+        n_gx = last_valid_gx;
+        n_gy = last_valid_gy;
+        n_gz = last_valid_gz;
+        last_valid_imu_timestamp = time_in_sec;
+      } else {
+        __android_log_print(ANDROID_LOG_WARN, TAG,
+                            "Dropping IMU spike at %.9f: acc_norm=%.3f gyro_norm=%.3f hard=%d jump=%d\n", time_in_sec, accel_norm,
+                            gyro_norm, hard_spike ? 1 : 0, jump_spike ? 1 : 0);
+        imu_sample_valid = false;
+      }
+    } else {
+      if (!imu_filter_initialized || dt <= 0.0 || dt >= IMU_FILTER_RESET_DT) {
+        imu_filter_initialized = true;
+      }
+      last_valid_imu_timestamp = time_in_sec;
+      last_valid_ax = n_ax;
+      last_valid_ay = n_ay;
+      last_valid_az = n_az;
+      last_valid_gx = n_gx;
+      last_valid_gy = n_gy;
+      last_valid_gz = n_gz;
+    }
+  }
+
+  if (!imu_sample_valid) {
+    return;
+  }
+
   // If recording save to disk
   if (is_recording && imu_csv.is_open()) {
     imu_csv << time_in_ns << "," << n_gx << "," << n_gy << "," << n_gz << "," << n_ax << "," << n_ay << "," << n_az << std::endl;
     //    __android_log_print(ANDROID_LOG_INFO, TAG, "%.4f, %.4f, %.4f | %.4f, %.4f, %.4f \n", n_ax, n_ay, n_az, n_gx, n_gy, n_gz);
   }
 
+  std::shared_ptr<ov_msckf::VioManager> local_sys;
+  {
+    std::lock_guard<std::mutex> sys_lck(sys_mtx);
+    local_sys = sys;
+  }
+
   // Feed if the system is running!
-  if (sys != nullptr) {
+  if (local_sys != nullptr) {
+    {
+      std::lock_guard<std::mutex> imu_lck(imu_timestamp_mtx);
+      if (time_in_sec <= last_accepted_imu_timestamp) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "Skipping non-monotonic IMU timestamp: %.9f <= %.9f\n", time_in_sec,
+                            last_accepted_imu_timestamp);
+        return;
+      }
+      last_accepted_imu_timestamp = time_in_sec;
+      latest_imu_timestamp = time_in_sec;
+      accepted_imu_count++;
+    }
 
     // Send it into the system
     ov_core::ImuData message_imu;
     message_imu.timestamp = time_in_sec;
     message_imu.wm << n_gx, n_gy, n_gz;
     message_imu.am << n_ax, n_ay, n_az;
-    sys->feed_measurement_imu(message_imu);
-
-    // Update the latest IMU timestamp (worker thread will poll for this)
-    {
-      std::lock_guard<std::mutex> imu_lck(imu_timestamp_mtx);
-      latest_imu_timestamp = time_in_sec;
+    try {
+      local_sys->feed_measurement_imu(message_imu);
+    } catch (const std::exception &e) {
+      __android_log_print(ANDROID_LOG_ERROR, TAG, "feed_measurement_imu exception: %s\n", e.what());
+    } catch (...) {
+      __android_log_print(ANDROID_LOG_ERROR, TAG, "feed_measurement_imu unknown exception\n");
     }
   }
 }
@@ -880,11 +1048,17 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIne
 extern "C" JNIEXPORT jboolean JNICALL Java_com_openvins_android_VioEngine_getCurrentPoseJNI(JNIEnv *env, jobject instance,
                                                                                             jdoubleArray position,
                                                                                             jdoubleArray quaternion) {
-  if (sys == nullptr || !is_running_ov) {
+  std::shared_ptr<ov_msckf::VioManager> local_sys;
+  {
+    std::lock_guard<std::mutex> sys_lck(sys_mtx);
+    local_sys = sys;
+  }
+
+  if (local_sys == nullptr || !is_running_ov) {
     return JNI_FALSE;
   }
 
-  auto state = sys->get_state();
+  auto state = local_sys->get_state();
   if (state == nullptr) {
     return JNI_FALSE;
   }

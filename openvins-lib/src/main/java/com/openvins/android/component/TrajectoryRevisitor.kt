@@ -13,7 +13,7 @@ import glm_.vec3.Vec3d
 import kotlin.math.max
 
 class TrajectoryRevisitor {
-    private val _config: Map<String, Any> = emptyMap()
+    private var _config: Map<String, Any> = emptyMap()
     private var _revisitMileage: Double = 1.5
     private var _maxDistance: Double = 0.5
     private var _impactThreshold: Double = 0.35
@@ -30,17 +30,25 @@ class TrajectoryRevisitor {
     constructor() {}
 
     fun setConfig(config: Map<String, Any>) {
-        _config.plus(config)
-        _revisitMileage = _config.getOrElse("revisitMileage") { 1.5 } as Double
-        _maxDistance = _config.getOrElse("maxDistance") { 0.5 } as Double
-        _impactThreshold = _config.getOrElse("impactThreshold") { 0.5 } as Double
-        _absPoseErrRotFro = _config.getOrElse("absPoseErrRotFro") { 0.2 } as Double
-        _pointDistance = _config.getOrElse("pointDistance") { 0.5 } as Double
-        _shiftingMileage = _config.getOrElse("shiftingMileage") { 1.0 } as Double
+        _config = config.toMap()
+        _revisitMileage = doubleConfig("revisitMileage", 1.5)
+        _maxDistance = doubleConfig("maxDistance", 0.5)
+        _impactThreshold = doubleConfig("impactThreshold", 0.5)
+        _absPoseErrRotFro = doubleConfig("absPoseErrRotFro", 0.2)
+        _pointDistance = doubleConfig("pointDistance", 0.5)
+        _shiftingMileage = doubleConfig("shiftingMileage", 1.0)
 
-        _smoothingSigma = _config.getOrElse("smoothingSigma") { 1.0 } as Double
-        _sliceRemind = _config.getOrElse("sliceRemind") { 200 } as Int
-        _minTrajectoryLength = _config.getOrElse("minTrajectoryLength") { 20 } as Int
+        _smoothingSigma = doubleConfig("smoothingSigma", 1.0)
+        _sliceRemind = intConfig("sliceRemind", 200)
+        _minTrajectoryLength = intConfig("minTrajectoryLength", 20)
+    }
+
+    private fun doubleConfig(key: String, defaultValue: Double): Double {
+        return (_config[key] as? Number)?.toDouble() ?: defaultValue
+    }
+
+    private fun intConfig(key: String, defaultValue: Int): Int {
+        return (_config[key] as? Number)?.toInt() ?: defaultValue
     }
 
     private fun f2d(v: FloatArray): DoubleArray {

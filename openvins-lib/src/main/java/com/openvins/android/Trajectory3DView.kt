@@ -276,6 +276,7 @@ class TrajectoryRenderer(private val view: Trajectory3DView) : GLSurfaceView.Ren
         android.util.Log.d("Trajectory3D", "Surface changed: ${width}x${height}, aspect=$screenAspectRatio, base ortho=${baseOrthoWidth}x${baseOrthoHeight}")
     }
     
+    @Synchronized
     override fun onDrawFrame(gl: GL10?) {
         // Fully transparent background
         GLES20.glClearColor(0.0f, 0.0f, 0.0f, 0.0f)
@@ -494,9 +495,9 @@ class TrajectoryRenderer(private val view: Trajectory3DView) : GLSurfaceView.Ren
         GLES20.glDisableVertexAttribArray(colorHandle)
     }
     
+    @Synchronized
     fun updateTrajectory(positions: FloatArray, quaternions: FloatArray, 
                         currentPos: FloatArray, currentQuat: FloatArray) {
-        synchronized(this) {
             if (positions.isEmpty()) {
                 // Reset trajectory data when empty
                 trajectoryPointCount = 0
@@ -577,7 +578,6 @@ class TrajectoryRenderer(private val view: Trajectory3DView) : GLSurfaceView.Ren
             currentQuaternion = currentQuat.clone()
             
             updateFrustum()
-        }
     }
     
     private fun updateFrustum() {
@@ -1039,4 +1039,3 @@ class TrajectoryRenderer(private val view: Trajectory3DView) : GLSurfaceView.Ren
         private val gridFragmentShader = trajectoryFragmentShader
     }
 }
-
