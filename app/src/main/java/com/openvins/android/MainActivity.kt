@@ -185,6 +185,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
                 trajectoryView?.clearTrajectory()
                 candidateTranslations.clear()
                 candidateQuaternions.clear()
+                trajectoryRevisitor.reset()
                 val stopRecording = mOpenCvCameraView!!.stopRecording()
                 Log.d(TAG, "Stopped recording: $stopRecording")
                 true
@@ -427,6 +428,21 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
 
         val currPosFloats = FloatArray(3) { currentPos[it].toFloat() }
         val currQuatFloats = FloatArray(4) { currentQuat[it].toFloat() }
+
+        val shifting = trajectoryRevisitor.shiftingTrajectory(
+            currentPos, currentQuat
+        )
+        if (shifting) {
+            tvPose?.text = String.format("shifting")
+            val params = RelativeLayout.LayoutParams(
+                RelativeLayout.LayoutParams.WRAP_CONTENT,
+                RelativeLayout.LayoutParams.WRAP_CONTENT
+            )
+            params.setMargins(200, 400, 0, 0)
+            tvPose?.layoutParams = params
+        } else {
+            tvPose?.text = ""
+        }
 
         // 判断路径重访状态
 //        val result = trajectoryRevisitor.searchRevisitTrajectory(
