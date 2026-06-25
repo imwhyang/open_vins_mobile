@@ -17,7 +17,7 @@ class TrajectoryRevisitor {
     private var _revisitMileage: Double = 1.5
     private var _maxDistance: Double = 0.5
     private var _impactThreshold: Double = 0.35
-    private var _absPoseErrRotFro: Double = 0.1
+    private var _absPoseErrRotFro: Double = 0.2
     private var _pointDistance: Double = 0.5
 
     private var _smoothingSigma: Double = 1.0
@@ -31,6 +31,8 @@ class TrajectoryRevisitor {
         _revisitMileage = _config.getOrElse("revisitMileage") { 1.5 } as Double
         _maxDistance = _config.getOrElse("maxDistance") { 0.5 } as Double
         _impactThreshold = _config.getOrElse("impactThreshold") { 0.5 } as Double
+        _absPoseErrRotFro = _config.getOrElse("absPoseErrRotFro") { 0.2 } as Double
+        _pointDistance = _config.getOrElse("pointDistance") { 0.5 } as Double
 
         _smoothingSigma = _config.getOrElse("smoothingSigma") { 1.0 } as Double
         _sliceRemind = _config.getOrElse("sliceRemind") { 200 } as Int
@@ -68,7 +70,7 @@ class TrajectoryRevisitor {
         var trajectory =
             Trajectory.create(translations, quaternions) + Pose.create(translation, quaternion)
         if (trajectory.size() <= _minTrajectoryLength) {
-            return Result(false, 0.0, 0.0)
+            return Result()
         }
 
         var outerTrajectory = buildOuterTrajectory(trajectory)
@@ -79,13 +81,13 @@ class TrajectoryRevisitor {
         val tmpOuterMileage = Route.calculateMileage(outerTrajectory.points)
         val threshold = _revisitMileage + _maxDistance * 2.0
         if (tmpMileage < threshold || tmpOuterMileage < threshold) {
-            return Result(false, 1.0, 0.0)
+            return Result(impact = 1.0)
         }
 
         val tripleRange0 =
             Route.getMinimumSubPathReversed(trajectory.points, _revisitMileage, _maxDistance)
         if (tripleRange0.first < 0 || tripleRange0.third < 0) {
-            return Result(false, 2.0, 0.0)
+            return Result(impact = 2.0)
         }
         val queryTrajectory = trajectory.slice(tripleRange0.first, tripleRange0.second)
         trajectory = trajectory.slice(0, tripleRange0.third)
@@ -93,7 +95,7 @@ class TrajectoryRevisitor {
         val tripleRange1 =
             Route.getMinimumSubPathReversed(outerTrajectory.points, _revisitMileage, _maxDistance)
         if (tripleRange1.first < 0 || tripleRange1.third < 0) {
-            return Result(false, 3.0, 0.0)
+            return Result(impact = 3.0)
         }
         val queryOuterTrajectory = outerTrajectory.slice(tripleRange1.first, tripleRange1.second)
         outerTrajectory = outerTrajectory.slice(0, tripleRange1.third)
@@ -106,8 +108,8 @@ class TrajectoryRevisitor {
         val outerRadiationField = RadiationField(usedOuterTrajectory, _maxDistance)
         val outerImpact = outerRadiationField.calculateRadiationImpact(queryOuterTrajectory)
         return Result(
-            impact >= _impactThreshold && outerImpact >= _impactThreshold,
-            impact, outerImpact
+            isDuplicated = impact >= _impactThreshold && outerImpact >= _impactThreshold,
+            impact = impact, outerImpact = outerImpact
         )
     }
 
@@ -118,9 +120,10 @@ class TrajectoryRevisitor {
         queryQuaternion: DoubleArray,
     ): Result {
         if (candidateTranslations.size != candidateQuaternions.size) {
-            return Result(false)
+            return Result()
         }
         val invQueryPose = SO3.create(queryQuaternion).inverse()
+        val tmp = doubleArrayOf(1000.0, 0.0, 0.0)
         for (i in candidateTranslations.indices) {
             val candidatePose = SO3.create(candidateQuaternions[i])
             val resultQuat = (invQueryPose * candidatePose).toQuat()
@@ -129,13 +132,19 @@ class TrajectoryRevisitor {
                 Utils.distancePointToPoint(candidateTranslations[i], queryTranslation)
             if (absPoseErrRotFro < _absPoseErrRotFro && pointDistance < _pointDistance) {
                 return Result(
-                    true,
+                    isRetrieve = true,
                     absPoseErrRotFro = absPoseErrRotFro,
                     pointDistance = pointDistance
                 )
             }
+            val ratio = _absPoseErrRotFro * pointDistance + _pointDistance * absPoseErrRotFro
+            if (ratio < tmp[0]) {
+                tmp[0] = ratio
+                tmp[1] = absPoseErrRotFro
+                tmp[2] = pointDistance
+            }
         }
-        return Result(false)
+        return Result(absPoseErrRotFro = tmp[1], pointDistance = tmp[2])
     }
 
     fun captureRevisited(
@@ -170,19 +179,21 @@ class TrajectoryRevisitor {
         queryTranslation: DoubleArray,
         queryQuaternion: DoubleArray,
     ): Result {
-        val result0 = searchRevisitTrajectory(translations, quaternions, translation, quaternion)
-        val result1 = queryVisitedPoses(
+        val result0 = queryVisitedPoses(
             candidateTranslations,
             candidateQuaternions,
             queryTranslation,
             queryQuaternion
         )
+        val result1 = searchRevisitTrajectory(translations, quaternions, translation, quaternion)
         val result = Result(
-            result0.isRevisit || result1.isRevisit,
-            impact = result0.impact,
-            outerImpact = result0.outerImpact,
-            absPoseErrRotFro = result1.absPoseErrRotFro,
-            pointDistance = result1.pointDistance,
+            result0.isRetrieve || result1.isDuplicated,
+            isRetrieve = result0.isRetrieve,
+            isDuplicated = result1.isDuplicated,
+            impact = result1.impact,
+            outerImpact = result1.outerImpact,
+            absPoseErrRotFro = result0.absPoseErrRotFro,
+            pointDistance = result0.pointDistance,
         )
         return result
     }
