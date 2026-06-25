@@ -84,7 +84,8 @@ grid_x: 5 # extraction sub-grid count for horizontal direction (uniform tracking
 grid_y: 5 # extraction sub-grid count for vertical direction (uniform tracking)
 min_px_dist: 10 # distance between features (features near each other provide less information)
 knn_ratio: 0.60 # descriptor knn threshold for the top two descriptor matches
-track_frequency: 31.0 # frequency we will perform feature tracking at (in frames per second / hertz)
+# for high performance device using 31.0, otherwise 16.0
+track_frequency: 31.0 # or 31.0 frequency we will perform feature tracking at (in frames per second / hertz)
 downsample_cameras: false # will downsample image in half if true
 num_opencv_threads: 2 # -1: auto, 0-1: serial, >1: number of threads
 histogram_method: "CLAHE" # NONE, HISTOGRAM, CLAHE
