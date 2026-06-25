@@ -19,10 +19,13 @@ class TrajectoryRevisitor {
     private var _impactThreshold: Double = 0.35
     private var _absPoseErrRotFro: Double = 0.2
     private var _pointDistance: Double = 0.5
+    private var _shiftingMileage: Double = 1.0
 
     private var _smoothingSigma: Double = 1.0
     private var _sliceRemind: Int = 300
     private var _minTrajectoryLength: Int = 20
+
+    private val _trajectoryShifting = mutableListOf<Pose>()
 
     constructor() {}
 
@@ -33,6 +36,7 @@ class TrajectoryRevisitor {
         _impactThreshold = _config.getOrElse("impactThreshold") { 0.5 } as Double
         _absPoseErrRotFro = _config.getOrElse("absPoseErrRotFro") { 0.2 } as Double
         _pointDistance = _config.getOrElse("pointDistance") { 0.5 } as Double
+        _shiftingMileage = _config.getOrElse("shiftingMileage") { 1.0 } as Double
 
         _smoothingSigma = _config.getOrElse("smoothingSigma") { 1.0 } as Double
         _sliceRemind = _config.getOrElse("sliceRemind") { 200 } as Int
@@ -223,5 +227,24 @@ class TrajectoryRevisitor {
         val slicedQuaternions =
             trajectory.quaternions.slice(0 until trajectory.quaternions.size step step)
         return Trajectory(slicedTranslations, slicedQuaternions)
+    }
+
+    fun shiftingTrajectory(
+        translation: DoubleArray,
+        quaternion: DoubleArray,
+    ): Boolean {
+        _trajectoryShifting.add(Pose.create(
+            translation = translation, quaternion = quaternion
+        ))
+        val lastTT = System.nanoTime() - 5e8
+        val tmpTrajectory = _trajectoryShifting.filter { it.timestamp >= lastTT }
+        val mileageInSecond = Route.calculateMileage(tmpTrajectory.map { it.position })
+        _trajectoryShifting.clear()
+        _trajectoryShifting.addAll(tmpTrajectory)
+        return mileageInSecond > _shiftingMileage
+    }
+
+    fun reset(){
+        _trajectoryShifting.clear()
     }
 }

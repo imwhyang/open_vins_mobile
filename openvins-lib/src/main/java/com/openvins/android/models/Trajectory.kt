@@ -13,7 +13,7 @@ data class Result(
     val pointDistance: Double = 0.0
 )
 
-data class Pose(val translation: Vec3d, val quaternion: QuatD) {
+data class Pose(val translation: Vec3d, val quaternion: QuatD, val timestamp: Long = 0) {
     val position: Vec3d = translation
     val point: Vec3d = translation
 
@@ -21,7 +21,8 @@ data class Pose(val translation: Vec3d, val quaternion: QuatD) {
         fun create(
             translation: DoubleArray,
             quaternion: DoubleArray,
-            order: String = "sxyz"
+            order: String = "sxyz",
+            timestamp: Long = 0,
         ): Pose {
             val t = Vec3d(translation[0], translation[1], translation[2])
             val q = if (order == "sxyz") {
@@ -29,7 +30,11 @@ data class Pose(val translation: Vec3d, val quaternion: QuatD) {
             } else {
                 QuatD(quaternion[3], quaternion[0], quaternion[1], quaternion[2])
             }
-            return Pose(t, q)
+            var tt = timestamp
+            if (timestamp == 0L) {
+                tt = System.nanoTime()
+            }
+            return Pose(t, q, tt)
         }
     }
 }
