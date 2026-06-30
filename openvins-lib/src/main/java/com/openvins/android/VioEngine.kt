@@ -36,17 +36,19 @@ class VioEngine {
         )
         for (fileName in assetFiles) {
             val dest = File(configDir, fileName)
-            if (!dest.exists()) {
-                try {
-                    context.assets.open("config/$fileName").use { input ->
+            try {
+                context.assets.open("config/$fileName").use { input ->
+                    val assetBytes = input.readBytes()
+                    val shouldWrite = !dest.exists() || !dest.readBytes().contentEquals(assetBytes)
+                    if (shouldWrite) {
                         FileOutputStream(dest).use { output ->
-                            input.copyTo(output)
+                            output.write(assetBytes)
                         }
+                        Log.i(TAG, "已同步 assets 配置文件：$fileName")
                     }
-                    Log.i(TAG, "已从 assets 解压配置文件：$fileName")
-                } catch (e: Exception) {
-                    Log.e(TAG, "解压配置文件失败：$fileName", e)
                 }
+            } catch (e: Exception) {
+                Log.e(TAG, "同步配置文件失败：$fileName", e)
             }
         }
         return configDir.parent ?: ""
