@@ -6,6 +6,9 @@ visual-inertial positioning, trajectory rendering, and barn revisit detection.
 ## Main Classes
 
 - `OpenVinsSdk`: lifecycle controller for camera frames, IMU, OpenVINS, trajectory updates, and revisit checks.
+- `BarnInsuranceSession`: one shooting session for a policy and barn.
+- `PenCheckRequest`: business input when the operator reaches a pen checkpoint.
+- `PenCaptureRecord`: uploadable checkpoint result with pose, trajectory, duplicate flags, and optional pig count.
 - `Camera2ResView`: camera preview and frame provider.
 - `Trajectory3DView`: optional OpenGL trajectory renderer.
 - `OpenVinsSdkListener`: callbacks for pose, trajectory, revisit result, and errors.
@@ -59,6 +62,7 @@ class BarnActivity : AppCompatActivity(), OpenVinsSdkListener {
         )
         sdk.bindCameraView(findViewById(R.id.openvins_camera))
         sdk.bindTrajectoryView(findViewById(R.id.openvins_trajectory))
+        sdk.beginInsuranceSession(policyId = "POLICY-001", barnId = "BARN-01")
     }
 
     override fun onResume() {
@@ -73,14 +77,21 @@ class BarnActivity : AppCompatActivity(), OpenVinsSdkListener {
     }
 
     fun onCheckBarnClicked() {
-        val result = sdk.checkBarnRevisit()
-        // result?.isRevisit == true means the current pose/path matches previous candidates.
+        val record = sdk.capturePenCheck(
+            PenCheckRequest(penId = "PEN-01", expectedPigCount = 35)
+        )
+        // record?.revisitResult?.isRevisit == true means the current pose/path
+        // matches previous candidates.
     }
 
     override fun onBarnRevisitChecked(result: BarnRevisitResult) {
         // Use result.isRetrieve for point-level revisit.
         // Use result.isDuplicated for trajectory-level duplicate route.
         // Use result.isMovingFast to flag unstable movement.
+    }
+
+    override fun onPenCaptured(record: PenCaptureRecord) {
+        // Persist or upload the pen-level route evidence.
     }
 }
 ```
@@ -103,8 +114,10 @@ revisit detection reliability.
 1. Call `sdk.start()` when entering the scanning page.
 2. Let OpenVINS initialize while the user moves the phone.
 3. At each pen/barn checkpoint, call `sdk.checkBarnRevisit()`.
-4. Store or upload `OpenVinsTrajectory` from `onTrajectoryChanged`.
-5. Call `sdk.captureTrajectoryImage(...)` when a trajectory map image is needed.
+4. Prefer `sdk.capturePenCheck(...)` in the insurance app so every result is
+   tied to `policyId`, `barnId`, and `penId`.
+5. Store or upload `sdk.exportSessionJson()` with the photo/video evidence.
+6. Call `sdk.captureTrajectoryImage(...)` when a trajectory map image is needed.
 
 ## Revisit Thresholds
 
