@@ -13,7 +13,10 @@ import com.openvins.android.Trajectory3DView
 import com.openvins.android.VioEngine
 import com.openvins.android.component.TrajectoryRevisitor
 import com.openvins.android.models.Result
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
+import java.util.UUID
 
 data class OpenVinsPose(
     val position: DoubleArray,
@@ -81,10 +84,37 @@ data class BarnRevisitResult(
     }
 }
 
+data class BarnInsuranceSession(
+    val sessionId: String = UUID.randomUUID().toString(),
+    val policyId: String,
+    val barnId: String,
+    val startedAtMs: Long = System.currentTimeMillis(),
+)
+
+data class PenCheckRequest(
+    val penId: String,
+    val expectedPigCount: Int? = null,
+    val operatorRemark: String? = null,
+)
+
+data class PenCaptureRecord(
+    val sessionId: String,
+    val policyId: String,
+    val barnId: String,
+    val penId: String,
+    val capturedAtMs: Long,
+    val pose: OpenVinsPose,
+    val trajectory: OpenVinsTrajectory,
+    val revisitResult: BarnRevisitResult,
+    val expectedPigCount: Int? = null,
+    val operatorRemark: String? = null,
+)
+
 interface OpenVinsSdkListener {
     fun onPoseChanged(pose: OpenVinsPose) {}
     fun onTrajectoryChanged(trajectory: OpenVinsTrajectory) {}
     fun onBarnRevisitChecked(result: BarnRevisitResult) {}
+    fun onPenCaptured(record: PenCaptureRecord) {}
     fun onError(message: String, throwable: Throwable? = null) {}
 }
 
@@ -107,9 +137,11 @@ class OpenVinsSdk(
     private var latestGyroTimestamp = 0L
     private var running = false
     private var poseRecording = false
+    private var activeSession: BarnInsuranceSession? = null
 
     private val candidateTranslations = arrayListOf<DoubleArray>()
     private val candidateQuaternions = arrayListOf<DoubleArray>()
+    private val penCaptureRecords = arrayListOf<PenCaptureRecord>()
 
     private val trajectoryRunnable = object : Runnable {
         override fun run() {
@@ -142,6 +174,32 @@ class OpenVinsSdk(
 
     fun configureBarnRevisit(config: Map<String, Any>) {
         trajectoryRevisitor.setConfig(config)
+    }
+
+    fun beginInsuranceSession(
+        policyId: String,
+        barnId: String,
+        sessionId: String = UUID.randomUUID().toString(),
+    ): BarnInsuranceSession {
+        val session = BarnInsuranceSession(
+            sessionId = sessionId,
+            policyId = policyId,
+            barnId = barnId,
+        )
+        activeSession = session
+        resetBarnRevisitCandidates()
+        penCaptureRecords.clear()
+        return session
+    }
+
+    fun finishInsuranceSession(): List<PenCaptureRecord> {
+        val records = penCaptureRecords.toList()
+        activeSession = null
+        return records
+    }
+
+    fun getPenCaptureRecords(): List<PenCaptureRecord> {
+        return penCaptureRecords.toList()
     }
 
     fun resetBarnRevisitCandidates() {
@@ -201,6 +259,48 @@ class OpenVinsSdk(
         candidateQuaternions.add(pose.quaternion.copyOf())
         listener?.onBarnRevisitChecked(sdkResult)
         return sdkResult
+    }
+
+    fun capturePenCheck(request: PenCheckRequest): PenCaptureRecord? {
+        val session = activeSession
+        if (session == null) {
+            listener?.onError("Insurance session is not started.")
+            return null
+        }
+        val snapshot = getTrajectorySnapshot() ?: return null
+        val result = checkBarnRevisit() ?: return null
+        val record = PenCaptureRecord(
+            sessionId = session.sessionId,
+            policyId = session.policyId,
+            barnId = session.barnId,
+            penId = request.penId,
+            capturedAtMs = System.currentTimeMillis(),
+            pose = snapshot.currentPose,
+            trajectory = snapshot,
+            revisitResult = result,
+            expectedPigCount = request.expectedPigCount,
+            operatorRemark = request.operatorRemark,
+        )
+        penCaptureRecords.add(record)
+        listener?.onPenCaptured(record)
+        return record
+    }
+
+    fun exportSessionJson(): String {
+        val session = activeSession
+        val root = JSONObject()
+        if (session != null) {
+            root.put("sessionId", session.sessionId)
+            root.put("policyId", session.policyId)
+            root.put("barnId", session.barnId)
+            root.put("startedAtMs", session.startedAtMs)
+        }
+        val records = JSONArray()
+        for (record in penCaptureRecords) {
+            records.put(record.toJson())
+        }
+        root.put("penRecords", records)
+        return root.toString()
     }
 
     fun getCurrentPose(): OpenVinsPose? {
@@ -321,4 +421,55 @@ class OpenVinsSdk(
         private const val TRAJECTORY_UPDATE_MS = 50L
         private const val MAX_TRAJECTORY_POINTS = 10000
     }
+}
+
+private fun PenCaptureRecord.toJson(): JSONObject {
+    return JSONObject()
+        .put("sessionId", sessionId)
+        .put("policyId", policyId)
+        .put("barnId", barnId)
+        .put("penId", penId)
+        .put("capturedAtMs", capturedAtMs)
+        .put("expectedPigCount", expectedPigCount)
+        .put("operatorRemark", operatorRemark)
+        .put("pose", pose.toJson())
+        .put("trajectory", trajectory.toJson())
+        .put("revisitResult", revisitResult.toJson())
+}
+
+private fun OpenVinsPose.toJson(): JSONObject {
+    return JSONObject()
+        .put("position", position.toJsonArray())
+        .put("quaternion", quaternion.toJsonArray())
+}
+
+private fun OpenVinsTrajectory.toJson(): JSONObject {
+    return JSONObject()
+        .put("positions", positions.toJsonArray())
+        .put("quaternions", quaternions.toJsonArray())
+        .put("currentPose", currentPose.toJson())
+}
+
+private fun BarnRevisitResult.toJson(): JSONObject {
+    return JSONObject()
+        .put("isRevisit", isRevisit)
+        .put("isRetrieve", isRetrieve)
+        .put("isDuplicated", isDuplicated)
+        .put("isMovingFast", isMovingFast)
+        .put("impact", impact)
+        .put("outerImpact", outerImpact)
+        .put("rotationError", rotationError)
+        .put("pointDistance", pointDistance)
+}
+
+private fun DoubleArray.toJsonArray(): JSONArray {
+    val array = JSONArray()
+    for (value in this) array.put(value)
+    return array
+}
+
+private fun FloatArray.toJsonArray(): JSONArray {
+    val array = JSONArray()
+    for (value in this) array.put(value.toDouble())
+    return array
 }
