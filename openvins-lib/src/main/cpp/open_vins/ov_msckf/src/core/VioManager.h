@@ -136,6 +136,22 @@ public:
     feat_tracks_uvd = active_tracks_uvd;
   }
 
+  /// Returns the number of feature ids tracked in the latest image.
+  size_t get_last_track_count() {
+    if (trackFEATS == nullptr) {
+      return 0;
+    }
+    size_t count = 0;
+    auto last_ids = trackFEATS->get_last_ids();
+    for (const auto &pair : last_ids) {
+      count += pair.second.size();
+    }
+    return count;
+  }
+
+  /// Returns if the latest camera update used a zero-velocity update.
+  bool last_update_used_zupt() { return did_zupt_update; }
+
 protected:
   /**
    * @brief Given a new set of camera images, this will track them.

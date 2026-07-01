@@ -1,4 +1,5 @@
 #include <atomic>
+#include <algorithm>
 #include <cassert>
 #include <condition_variable>
 #include <cmath>
@@ -50,6 +51,7 @@ std::string app_private_folder = "/sdcard/"; // Private external files directory
 std::string save_folder = "/sdcard/";
 std::ofstream imu_csv;
 std::ofstream pose_ext_csv;
+std::ofstream trajectory_debug_csv;
 std::mutex pose_ext_csv_mtx;
 
 //=========================================================
@@ -128,6 +130,203 @@ struct TrajectoryPoint {
 std::vector<TrajectoryPoint> trajectory_history;
 std::mutex trajectory_mtx;
 const size_t MAX_TRAJECTORY_POINTS = 10000; // Limit trajectory size
+const double TRAJECTORY_DEBUG_JUMP_METERS = 0.25;
+const double TRAJECTORY_DEBUG_SPEED_MPS = 1.5;
+const double TRAJECTORY_DEBUG_ROTATION_RAD = 0.52; // 30 deg
+const size_t TRAJECTORY_GATE_MIN_FEATURES = 20;
+const size_t TRAJECTORY_GATE_LOW_FEATURES = 50;
+const size_t TRAJECTORY_GATE_ROTATION_FEATURES = 60;
+const double TRAJECTORY_GATE_MAX_STEP_METERS = 0.80;
+const double TRAJECTORY_GATE_MAX_SPEED_MPS = 1.5;
+const double TRAJECTORY_GATE_LOW_FEATURE_STEP_METERS = 0.35;
+const double TRAJECTORY_GATE_ROTATION_STEP_METERS = 0.15;
+const double TRAJECTORY_GATE_ROTATION_RAD = 0.52; // 30 deg
+const double TRAJECTORY_TURN_GUARD_ROT_RAD = 0.08;
+const double TRAJECTORY_TURN_GUARD_MAX_STEP_METERS = 0.08;
+const double TRAJECTORY_TURN_GUARD_SECONDS = 1.00;
+const double TRAJECTORY_TURN_GUARD_BACKWARD_PROJECTION = -0.25;
+const double TRAJECTORY_TURN_GUARD_MIN_STEP_METERS = 0.03;
+const double TRAJECTORY_TURN_GUARD_FAST_SPEED_MPS = 1.5;
+const double TRAJECTORY_TURN_GUARD_FAST_STEP_METERS = 0.05;
+const double TRAJECTORY_TURN_GUARD_LOW_FEATURE_STEP_METERS = 0.12;
+const size_t TRAJECTORY_TURN_GUARD_LOW_FEATURES = 80;
+
+enum TrajectoryRejectReason {
+  TRAJECTORY_REJECT_NONE = 0,
+  TRAJECTORY_REJECT_BAD_DT = 1,
+  TRAJECTORY_REJECT_LOW_FEATURES = 2,
+  TRAJECTORY_REJECT_LARGE_JUMP = 3,
+  TRAJECTORY_REJECT_HIGH_SPEED = 4,
+  TRAJECTORY_REJECT_LOW_FEATURE_JUMP = 5,
+  TRAJECTORY_REJECT_ROTATION_LOW_FEATURE_JUMP = 6,
+  TRAJECTORY_REJECT_BACKWARD_AFTER_TURN = 7,
+  TRAJECTORY_REJECT_FAST_AFTER_TURN = 8,
+  TRAJECTORY_REJECT_LOW_FEATURE_TURN_JUMP = 9,
+};
+
+double trajectory_debug_last_timestamp = -1.0;
+double trajectory_turn_guard_until_timestamp = -1.0;
+bool trajectory_debug_has_last_pose = false;
+TrajectoryPoint trajectory_debug_last_pose(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0);
+
+double trajectory_quaternion_angle(const TrajectoryPoint &last, double qw, double qx, double qy, double qz) {
+  double dot = std::abs(last.qw * qw + last.qx * qx + last.qy * qy + last.qz * qz);
+  dot = std::min(1.0, std::max(-1.0, dot));
+  return 2.0 * std::acos(dot);
+}
+
+double trajectory_forward_projection(const Eigen::Vector3d &position) {
+  if (!trajectory_debug_has_last_pose) {
+    return 0.0;
+  }
+
+  Eigen::Vector3d delta(position(0) - trajectory_debug_last_pose.x, position(1) - trajectory_debug_last_pose.y,
+                        position(2) - trajectory_debug_last_pose.z);
+  double step = delta.norm();
+  if (step <= 1e-6) {
+    return 0.0;
+  }
+
+  Eigen::Vector4d q_GtoC;
+  q_GtoC << trajectory_debug_last_pose.qx, trajectory_debug_last_pose.qy, trajectory_debug_last_pose.qz, trajectory_debug_last_pose.qw;
+  Eigen::Vector3d camera_forward_in_global = ov_core::quat_2_Rot(q_GtoC).transpose() * Eigen::Vector3d::UnitZ();
+  return delta.normalized().dot(camera_forward_in_global.normalized());
+}
+
+bool compute_trajectory_delta(double timestamp, const Eigen::Vector3d &position, const Eigen::Vector4d &quaternion, double &dt, double &step,
+                              double &speed, double &rot, double &forward_projection) {
+  dt = 0.0;
+  step = 0.0;
+  speed = 0.0;
+  rot = 0.0;
+  forward_projection = 0.0;
+
+  if (!trajectory_debug_has_last_pose) {
+    return false;
+  }
+
+  double qw = quaternion(3);
+  double qx = quaternion(0);
+  double qy = quaternion(1);
+  double qz = quaternion(2);
+  dt = timestamp - trajectory_debug_last_timestamp;
+  double dx = position(0) - trajectory_debug_last_pose.x;
+  double dy = position(1) - trajectory_debug_last_pose.y;
+  double dz = position(2) - trajectory_debug_last_pose.z;
+  step = std::sqrt(dx * dx + dy * dy + dz * dz);
+  speed = (dt > 1e-6) ? step / dt : 0.0;
+  rot = trajectory_quaternion_angle(trajectory_debug_last_pose, qw, qx, qy, qz);
+  forward_projection = trajectory_forward_projection(position);
+  return true;
+}
+
+bool should_accept_trajectory_point(double timestamp, const Eigen::Vector3d &position, const Eigen::Vector4d &quaternion, size_t feature_count,
+                                    int &reject_reason) {
+  reject_reason = TRAJECTORY_REJECT_NONE;
+
+  double dt = 0.0;
+  double step = 0.0;
+  double speed = 0.0;
+  double rot = 0.0;
+  double forward_projection = 0.0;
+  if (!compute_trajectory_delta(timestamp, position, quaternion, dt, step, speed, rot, forward_projection)) {
+    return true;
+  }
+
+  if (rot > TRAJECTORY_TURN_GUARD_ROT_RAD && step < TRAJECTORY_TURN_GUARD_MAX_STEP_METERS) {
+    trajectory_turn_guard_until_timestamp = std::max(trajectory_turn_guard_until_timestamp, timestamp + TRAJECTORY_TURN_GUARD_SECONDS);
+  }
+  bool turn_guard_active = timestamp <= trajectory_turn_guard_until_timestamp;
+
+  if (dt <= 0.0) {
+    reject_reason = TRAJECTORY_REJECT_BAD_DT;
+    return false;
+  }
+  if (feature_count < TRAJECTORY_GATE_MIN_FEATURES) {
+    reject_reason = TRAJECTORY_REJECT_LOW_FEATURES;
+    return false;
+  }
+  if (step > TRAJECTORY_GATE_MAX_STEP_METERS) {
+    reject_reason = TRAJECTORY_REJECT_LARGE_JUMP;
+    return false;
+  }
+  if (speed > TRAJECTORY_GATE_MAX_SPEED_MPS) {
+    reject_reason = TRAJECTORY_REJECT_HIGH_SPEED;
+    return false;
+  }
+  if (step > TRAJECTORY_GATE_LOW_FEATURE_STEP_METERS && feature_count < TRAJECTORY_GATE_LOW_FEATURES) {
+    reject_reason = TRAJECTORY_REJECT_LOW_FEATURE_JUMP;
+    return false;
+  }
+  if (step > TRAJECTORY_GATE_ROTATION_STEP_METERS && rot > TRAJECTORY_GATE_ROTATION_RAD &&
+      feature_count < TRAJECTORY_GATE_ROTATION_FEATURES) {
+    reject_reason = TRAJECTORY_REJECT_ROTATION_LOW_FEATURE_JUMP;
+    return false;
+  }
+  if (turn_guard_active && step > TRAJECTORY_TURN_GUARD_MIN_STEP_METERS &&
+      forward_projection < TRAJECTORY_TURN_GUARD_BACKWARD_PROJECTION) {
+    reject_reason = TRAJECTORY_REJECT_BACKWARD_AFTER_TURN;
+    return false;
+  }
+  if (turn_guard_active && step > TRAJECTORY_TURN_GUARD_FAST_STEP_METERS && speed > TRAJECTORY_TURN_GUARD_FAST_SPEED_MPS) {
+    reject_reason = TRAJECTORY_REJECT_FAST_AFTER_TURN;
+    return false;
+  }
+  if (turn_guard_active && step > TRAJECTORY_TURN_GUARD_LOW_FEATURE_STEP_METERS &&
+      feature_count < TRAJECTORY_TURN_GUARD_LOW_FEATURES) {
+    reject_reason = TRAJECTORY_REJECT_LOW_FEATURE_TURN_JUMP;
+    return false;
+  }
+
+  return true;
+}
+
+void reset_trajectory_debug_state() {
+  trajectory_debug_last_timestamp = -1.0;
+  trajectory_turn_guard_until_timestamp = -1.0;
+  trajectory_debug_has_last_pose = false;
+  trajectory_debug_last_pose = TrajectoryPoint(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0);
+}
+
+void record_trajectory_debug(double timestamp, const Eigen::Vector3d &position, const Eigen::Vector4d &quaternion, size_t trajectory_size,
+                             size_t feature_count, bool zupt_active, bool accepted, int reject_reason) {
+  double qw = quaternion(3);
+  double qx = quaternion(0);
+  double qy = quaternion(1);
+  double qz = quaternion(2);
+
+  double dt = 0.0;
+  double step = 0.0;
+  double speed = 0.0;
+  double rot = 0.0;
+  double forward_projection = 0.0;
+  bool anomaly = false;
+  bool turn_guard_active = timestamp <= trajectory_turn_guard_until_timestamp;
+
+  if (compute_trajectory_delta(timestamp, position, quaternion, dt, step, speed, rot, forward_projection)) {
+    anomaly = dt <= 0.0 || step > TRAJECTORY_DEBUG_JUMP_METERS || speed > TRAJECTORY_DEBUG_SPEED_MPS ||
+              (step > 0.03 && rot > TRAJECTORY_DEBUG_ROTATION_RAD);
+  }
+
+  if (trajectory_debug_csv.is_open()) {
+    trajectory_debug_csv << std::fixed << std::setprecision(9) << timestamp << "," << trajectory_size << "," << position(0) << ","
+                         << position(1) << "," << position(2) << "," << qx << "," << qy << "," << qz << "," << qw << "," << dt
+                         << "," << step << "," << speed << "," << rot << "," << feature_count << "," << (zupt_active ? 1 : 0) << ","
+                         << forward_projection << "," << (turn_guard_active ? 1 : 0) << "," << (accepted ? 1 : 0) << ","
+                         << reject_reason << "," << (anomaly ? 1 : 0) << std::endl;
+  }
+
+  if (anomaly || !accepted) {
+    __android_log_print(ANDROID_LOG_WARN, TAG,
+                        "Trajectory point: t=%.6f dt=%.4f step=%.3f speed=%.3f rot_deg=%.1f forward=%.2f guard=%d features=%zu zupt=%d accepted=%d reason=%d size=%zu\n",
+                        timestamp, dt, step, speed, rot * 180.0 / M_PI, forward_projection, turn_guard_active ? 1 : 0, feature_count,
+                        zupt_active ? 1 : 0, accepted ? 1 : 0, reject_reason, trajectory_size);
+  }
+
+  trajectory_debug_last_timestamp = timestamp;
+  trajectory_debug_has_last_pose = true;
+  trajectory_debug_last_pose = TrajectoryPoint(position(0), position(1), position(2), qw, qx, qy, qz);
+}
 
 // JNI OnLoad/OnUnload handlers for proper cleanup
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) { return JNI_VERSION_1_6; }
@@ -321,10 +520,18 @@ void processing_worker_thread() {
         // Store trajectory point (camera pose)
         // q_cam is JPL format [qx, qy, qz, qw], but TrajectoryPoint expects [qw, qx, qy, qz]
         std::lock_guard<std::mutex> traj_lck(trajectory_mtx);
-        trajectory_history.emplace_back(p_cam(0), p_cam(1), p_cam(2), q_cam(3), q_cam(0), q_cam(1), q_cam(2));
-        if (trajectory_history.size() > MAX_TRAJECTORY_POINTS) {
-          trajectory_history.erase(trajectory_history.begin());
+        size_t feature_count = local_sys->get_last_track_count();
+        bool zupt_active = local_sys->last_update_used_zupt();
+        int reject_reason = TRAJECTORY_REJECT_NONE;
+        bool accept_trajectory_point = should_accept_trajectory_point(state->_timestamp, p_cam, q_cam, feature_count, reject_reason);
+        if (accept_trajectory_point) {
+          trajectory_history.emplace_back(p_cam(0), p_cam(1), p_cam(2), q_cam(3), q_cam(0), q_cam(1), q_cam(2));
+          if (trajectory_history.size() > MAX_TRAJECTORY_POINTS) {
+            trajectory_history.erase(trajectory_history.begin());
+          }
         }
+        record_trajectory_debug(state->_timestamp, p_cam, q_cam, trajectory_history.size(), feature_count, zupt_active, accept_trajectory_point,
+                                reject_reason);
 
         // Display the current state
         std::stringstream ss1, ss2, ss3;
@@ -414,6 +621,13 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setRecordS
     std::string pose_csv_name = s + "pose0.csv";
     pose_ext_csv.open(save_folder + pose_csv_name);
     pose_ext_csv << "timestamp,p_x,p_y,p_z,q_x,q_y,q_z,q_w" << std::endl;
+
+    std::string trajectory_debug_csv_name = s + "trajectory_debug.csv";
+    trajectory_debug_csv.open(save_folder + trajectory_debug_csv_name);
+    trajectory_debug_csv
+        << "timestamp,trajectory_size,p_x,p_y,p_z,q_x,q_y,q_z,q_w,dt,step_m,speed_mps,rot_rad,feature_count,zupt_active,forward_projection,turn_guard_active,accepted,reject_reason,anomaly"
+        << std::endl;
+    reset_trajectory_debug_state();
   } else {
 
     // If the file was open, then close it
@@ -423,6 +637,10 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setRecordS
     if (pose_ext_csv.is_open()) {
       pose_ext_csv.close();
     }
+    if (trajectory_debug_csv.is_open()) {
+      trajectory_debug_csv.close();
+    }
+    reset_trajectory_debug_state();
   }
 }
 
@@ -482,6 +700,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_toggleSyst
     viz_state1 = "";
     viz_state2 = "";
     viz_state3 = "";
+    reset_trajectory_debug_state();
 
     __android_log_print(ANDROID_LOG_INFO, TAG, "OpenVINS system stopped\n");
   } else {
@@ -493,6 +712,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_toggleSyst
       std::lock_guard<std::mutex> traj_lck(trajectory_mtx);
       trajectory_history.clear();
     }
+    reset_trajectory_debug_state();
     {
       std::lock_guard<std::mutex> lck(camera_queue_mtx);
       camera_queue.clear();
