@@ -47,6 +47,11 @@ android {
     kotlinOptions {
         jvmTarget = '1.8'
     }
+    sourceSets {
+        main {
+            jniLibs.srcDirs += [project(':thirdparty:boost').projectDir.absolutePath + '/libs']
+        }
+    }
 }
 
 dependencies {
