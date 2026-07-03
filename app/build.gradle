@@ -4,7 +4,7 @@ plugins {
 }
 
 android {
-    namespace "com.openvins.android"
+    namespace "com.openvins.app"
     compileSdk 30
 
     defaultConfig {
