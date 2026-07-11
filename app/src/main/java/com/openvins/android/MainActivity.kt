@@ -1,6 +1,12 @@
-package com.openvins.android
+package com.openvins.app
+
+import com.openvins.android.Camera2ResView
+import com.openvins.android.CameraFrameListener
+import com.openvins.android.Trajectory3DView
+import com.openvins.android.VioEngine
 
 import android.Manifest
+import android.content.Context
 import android.content.DialogInterface
 import android.content.pm.PackageManager
 import android.hardware.Sensor
@@ -57,8 +63,8 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     }
 
     private var vioEngine = VioEngine()
-    private val candidateTranslations: ArrayList<DoubleArray> = arrayListOf()
-    private val candidateQuaternions: ArrayList<DoubleArray> = arrayListOf()
+   private val candidateTranslations: ArrayList<DoubleArray> = arrayListOf()
+   private val candidateQuaternions: ArrayList<DoubleArray> = arrayListOf()
 
     init {
         Log.i(TAG, "Instantiated new " + this.javaClass)
@@ -93,7 +99,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         //mOpenCvCameraView!!.setFocusMode(this, Camera.Parameters.FOCUS_MODE_INFINITY)
 
         // Check that we have our accelerometer and gyroscope sensors
-        sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
+        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         sensorAccel = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         sensorGyro = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
         if (sensorAccel == null) {
@@ -451,6 +457,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         val currPosFloats = FloatArray(3) { currentPos[it].toFloat() }
         val currQuatFloats = FloatArray(4) { currentQuat[it].toFloat() }
 
+//        当前数据是否飘移
         val shifting = trajectoryRevisitor.shiftingTrajectory(
             currentPos, currentQuat
         )
