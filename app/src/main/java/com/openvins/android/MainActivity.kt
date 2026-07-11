@@ -429,6 +429,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         val currPosFloats = FloatArray(3) { currentPos[it].toFloat() }
         val currQuatFloats = FloatArray(4) { currentQuat[it].toFloat() }
 
+//        当前数据是否飘移
         val shifting = trajectoryRevisitor.shiftingTrajectory(
             currentPos, currentQuat
         )
