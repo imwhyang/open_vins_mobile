@@ -398,19 +398,36 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
             trajectoryPauseAcknowledged = false
         }
 
-        // Get current pose
-        val currentPos = DoubleArray(3)
-        val currentQuat = DoubleArray(4)
-        if (!vioEngine.getCurrentPose(currentPos, currentQuat)) {
-            return // System not initialized
-        }
-
         // Allocate arrays with maximum expected size (MAX_TRAJECTORY_POINTS = 10000)
         val maxSize = 10000
         val positions = DoubleArray(maxSize * 3)
         val quaternions = DoubleArray(maxSize * 4)
-
         val trajectorySize = vioEngine.getTrajectoryData(positions, quaternions)
+
+        // Get current pose
+        val currentPos = DoubleArray(3)
+        val currentQuat = DoubleArray(4)
+        if (!vioEngine.getCurrentPose(currentPos, currentQuat)) {
+            if (trajectorySize > 0) {
+                val lastIndex = trajectorySize - 1
+                trajectoryView?.updateTrajectory(
+                    FloatArray(trajectorySize * 3) { positions[it].toFloat() },
+                    FloatArray(trajectorySize * 4) { quaternions[it].toFloat() },
+                    floatArrayOf(
+                        positions[lastIndex * 3].toFloat(),
+                        positions[lastIndex * 3 + 1].toFloat(),
+                        positions[lastIndex * 3 + 2].toFloat()
+                    ),
+                    floatArrayOf(
+                        quaternions[lastIndex * 4].toFloat(),
+                        quaternions[lastIndex * 4 + 1].toFloat(),
+                        quaternions[lastIndex * 4 + 2].toFloat(),
+                        quaternions[lastIndex * 4 + 3].toFloat()
+                    )
+                )
+            }
+            return // System not initialized
+        }
 
         if (trajectorySize == 0) {
             // Empty trajectory or error
