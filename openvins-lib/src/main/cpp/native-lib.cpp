@@ -163,11 +163,20 @@ enum TrajectoryRejectReason {
   TRAJECTORY_REJECT_FAST_AFTER_TURN = 8,
   TRAJECTORY_REJECT_LOW_FEATURE_TURN_JUMP = 9,
 };
+const size_t TRAJECTORY_DRIFT_REJECT_STREAK = 3;
 
 double trajectory_debug_last_timestamp = -1.0;
 double trajectory_turn_guard_until_timestamp = -1.0;
 bool trajectory_debug_has_last_pose = false;
 TrajectoryPoint trajectory_debug_last_pose(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0);
+bool trajectory_data_paused = false;
+bool trajectory_pause_prompt_pending = false;
+int trajectory_pause_reason = TRAJECTORY_REJECT_NONE;
+size_t trajectory_drift_reject_streak = 0;
+bool trajectory_alignment_pending = false;
+bool trajectory_alignment_active = false;
+Eigen::Vector3d trajectory_alignment_anchor(0.0, 0.0, 0.0);
+Eigen::Vector3d trajectory_alignment_offset(0.0, 0.0, 0.0);
 
 double trajectory_quaternion_angle(const TrajectoryPoint &last, double qw, double qx, double qy, double qz) {
   double dot = std::abs(last.qw * qw + last.qx * qx + last.qy * qy + last.qz * qz);
@@ -281,11 +290,32 @@ bool should_accept_trajectory_point(double timestamp, const Eigen::Vector3d &pos
   return true;
 }
 
+bool is_trajectory_drift_reason(int reject_reason) {
+  return reject_reason == TRAJECTORY_REJECT_LARGE_JUMP || reject_reason == TRAJECTORY_REJECT_HIGH_SPEED ||
+         reject_reason == TRAJECTORY_REJECT_BACKWARD_AFTER_TURN || reject_reason == TRAJECTORY_REJECT_FAST_AFTER_TURN ||
+         reject_reason == TRAJECTORY_REJECT_LOW_FEATURE_TURN_JUMP;
+}
+
+void pause_trajectory_data(int reject_reason) {
+  trajectory_data_paused = true;
+  trajectory_pause_prompt_pending = true;
+  trajectory_pause_reason = reject_reason;
+  trajectory_drift_reject_streak = 0;
+}
+
 void reset_trajectory_debug_state() {
   trajectory_debug_last_timestamp = -1.0;
   trajectory_turn_guard_until_timestamp = -1.0;
   trajectory_debug_has_last_pose = false;
   trajectory_debug_last_pose = TrajectoryPoint(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0);
+  trajectory_data_paused = false;
+  trajectory_pause_prompt_pending = false;
+  trajectory_pause_reason = TRAJECTORY_REJECT_NONE;
+  trajectory_drift_reject_streak = 0;
+  trajectory_alignment_pending = false;
+  trajectory_alignment_active = false;
+  trajectory_alignment_anchor = Eigen::Vector3d::Zero();
+  trajectory_alignment_offset = Eigen::Vector3d::Zero();
 }
 
 void record_trajectory_debug(double timestamp, const Eigen::Vector3d &position, const Eigen::Vector4d &quaternion, size_t trajectory_size,
@@ -520,17 +550,45 @@ void processing_worker_thread() {
         // Store trajectory point (camera pose)
         // q_cam is JPL format [qx, qy, qz, qw], but TrajectoryPoint expects [qw, qx, qy, qz]
         std::lock_guard<std::mutex> traj_lck(trajectory_mtx);
+        Eigen::Vector3d p_traj = p_cam;
+        if (trajectory_alignment_pending) {
+          Eigen::Vector3d alignment_anchor = trajectory_alignment_anchor;
+          Eigen::Vector3d alignment_offset = alignment_anchor - p_cam;
+          reset_trajectory_debug_state();
+          trajectory_alignment_anchor = alignment_anchor;
+          trajectory_alignment_offset = alignment_offset;
+          trajectory_alignment_active = true;
+          trajectory_alignment_pending = false;
+        }
+        if (trajectory_alignment_active) {
+          p_traj = p_cam + trajectory_alignment_offset;
+        }
         size_t feature_count = local_sys->get_last_track_count();
         bool zupt_active = local_sys->last_update_used_zupt();
         int reject_reason = TRAJECTORY_REJECT_NONE;
-        bool accept_trajectory_point = should_accept_trajectory_point(state->_timestamp, p_cam, q_cam, feature_count, reject_reason);
+        bool accept_trajectory_point = false;
+        if (!trajectory_data_paused) {
+          accept_trajectory_point = should_accept_trajectory_point(state->_timestamp, p_traj, q_cam, feature_count, reject_reason);
+        }
         if (accept_trajectory_point) {
-          trajectory_history.emplace_back(p_cam(0), p_cam(1), p_cam(2), q_cam(3), q_cam(0), q_cam(1), q_cam(2));
+          trajectory_history.emplace_back(p_traj(0), p_traj(1), p_traj(2), q_cam(3), q_cam(0), q_cam(1), q_cam(2));
           if (trajectory_history.size() > MAX_TRAJECTORY_POINTS) {
             trajectory_history.erase(trajectory_history.begin());
           }
+          trajectory_drift_reject_streak = 0;
+        } else if (!trajectory_data_paused && is_trajectory_drift_reason(reject_reason)) {
+          trajectory_drift_reject_streak++;
+          if (trajectory_drift_reject_streak >= TRAJECTORY_DRIFT_REJECT_STREAK) {
+            pause_trajectory_data(reject_reason);
+          }
+        } else if (!trajectory_data_paused) {
+          trajectory_drift_reject_streak = 0;
         }
-        record_trajectory_debug(state->_timestamp, p_cam, q_cam, trajectory_history.size(), feature_count, zupt_active, accept_trajectory_point,
+        if (trajectory_data_paused) {
+          accept_trajectory_point = false;
+          reject_reason = trajectory_pause_reason;
+        }
+        record_trajectory_debug(state->_timestamp, p_traj, q_cam, trajectory_history.size(), feature_count, zupt_active, accept_trajectory_point,
                                 reject_reason);
 
         // Display the current state
@@ -1235,20 +1293,20 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIne
     local_sys = sys;
   }
 
+  if (is_running_ov) {
+    std::lock_guard<std::mutex> imu_lck(imu_timestamp_mtx);
+    if (time_in_sec <= last_accepted_imu_timestamp) {
+      __android_log_print(ANDROID_LOG_WARN, TAG, "Skipping non-monotonic IMU timestamp: %.9f <= %.9f\n", time_in_sec,
+                          last_accepted_imu_timestamp);
+      return;
+    }
+    last_accepted_imu_timestamp = time_in_sec;
+    latest_imu_timestamp = time_in_sec;
+    accepted_imu_count++;
+  }
+
   // Feed if the system is running!
   if (local_sys != nullptr) {
-    {
-      std::lock_guard<std::mutex> imu_lck(imu_timestamp_mtx);
-      if (time_in_sec <= last_accepted_imu_timestamp) {
-        __android_log_print(ANDROID_LOG_WARN, TAG, "Skipping non-monotonic IMU timestamp: %.9f <= %.9f\n", time_in_sec,
-                            last_accepted_imu_timestamp);
-        return;
-      }
-      last_accepted_imu_timestamp = time_in_sec;
-      latest_imu_timestamp = time_in_sec;
-      accepted_imu_count++;
-    }
-
     // Send it into the system
     ov_core::ImuData message_imu;
     message_imu.timestamp = time_in_sec;
@@ -1298,6 +1356,15 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_openvins_android_VioEngine_getCur
   // Transform position: p_CinG = p_IinG - R_GtoC * p_IinC
   // where R_GtoC = quat_2_Rot(q_GtoC).transpose()
   Eigen::Vector3d p_cam = p_IinG - ov_core::quat_2_Rot(q_cam).transpose() * p_IinC;
+  {
+    std::lock_guard<std::mutex> traj_lck(trajectory_mtx);
+    if (trajectory_alignment_active) {
+      p_cam = p_cam + trajectory_alignment_offset;
+    } else if (trajectory_alignment_pending && !trajectory_history.empty()) {
+      const auto &last = trajectory_history.back();
+      p_cam = Eigen::Vector3d(last.x, last.y, last.z);
+    }
+  }
 
   jdouble pos[3] = {p_cam(0), p_cam(1), p_cam(2)};
   // Convert JPL [qx, qy, qz, qw] to Hamilton [qw, qx, qy, qz] for Java
@@ -1361,4 +1428,59 @@ extern "C" JNIEXPORT jint JNICALL Java_com_openvins_android_VioEngine_getTraject
   env->ReleaseDoubleArrayElements(quaternions, quat_array, 0);
 
   return static_cast<jint>(size);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_com_openvins_android_VioEngine_isTrajectoryPausedJNI(JNIEnv *env, jobject instance) {
+  std::lock_guard<std::mutex> lck(trajectory_mtx);
+  return trajectory_data_paused ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jint JNICALL Java_com_openvins_android_VioEngine_getTrajectoryPauseReasonJNI(JNIEnv *env, jobject instance) {
+  std::lock_guard<std::mutex> lck(trajectory_mtx);
+  return trajectory_pause_reason;
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_resumeTrajectoryJNI(JNIEnv *env, jobject instance) {
+  {
+    std::lock_guard<std::mutex> traj_lck(trajectory_mtx);
+    trajectory_data_paused = false;
+    trajectory_pause_prompt_pending = false;
+    trajectory_pause_reason = TRAJECTORY_REJECT_NONE;
+    trajectory_drift_reject_streak = 0;
+    trajectory_debug_last_timestamp = -1.0;
+    trajectory_turn_guard_until_timestamp = -1.0;
+    trajectory_debug_has_last_pose = false;
+    trajectory_debug_last_pose = TrajectoryPoint(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0);
+
+    if (!trajectory_history.empty()) {
+      const auto &last = trajectory_history.back();
+      trajectory_alignment_anchor = Eigen::Vector3d(last.x, last.y, last.z);
+      trajectory_alignment_pending = true;
+      trajectory_alignment_active = false;
+      trajectory_alignment_offset = Eigen::Vector3d::Zero();
+    } else {
+      trajectory_alignment_pending = false;
+      trajectory_alignment_active = false;
+      trajectory_alignment_anchor = Eigen::Vector3d::Zero();
+      trajectory_alignment_offset = Eigen::Vector3d::Zero();
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> sys_lck(sys_mtx);
+    sys = nullptr;
+  }
+  {
+    std::lock_guard<std::mutex> lck(camera_queue_mtx);
+    camera_queue.clear();
+    camera_last_timestamp.clear();
+  }
+  viz_time = -1;
+  viz_track_rate = 0.0;
+  viz_track_last_time = -1.0;
+  viz_state1 = "";
+  viz_state2 = "";
+  viz_state3 = "";
+
+  __android_log_print(ANDROID_LOG_INFO, TAG, "Trajectory resumed with VIO reinitialization\n");
 }

@@ -52,6 +52,8 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     private val trajectoryRevisitor: TrajectoryRevisitor = TrajectoryRevisitor()
 
     private var trajectoryView: Trajectory3DView? = null
+    private var trajectoryPauseDialogShowing = false
+    private var trajectoryPauseAcknowledged = false
     private val trajectoryUpdateHandler = Handler(Looper.getMainLooper())
     private val trajectoryUpdateRunnable = object : Runnable {
         override fun run() {
@@ -170,6 +172,8 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         // Our start / stop openvins button
         val reset = findViewById(R.id.toggle_reset) as FloatingActionButton
         reset.setOnClickListener {
+            trajectoryPauseDialogShowing = false
+            trajectoryPauseAcknowledged = false
             isRunningOV = if (isRunningOV) {
                 reset.setImageResource(R.drawable.ic_baseline_play_arrow_24)
 //                时间戳
@@ -393,19 +397,43 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     private fun updateTrajectoryView() {
         if (trajectoryView == null) return
 
-        // Get current pose
-        val currentPos = DoubleArray(3)
-        val currentQuat = DoubleArray(4)
-        if (!vioEngine.getCurrentPose(currentPos, currentQuat)) {
-            return // System not initialized
+        if (vioEngine.isTrajectoryPaused()) {
+            showTrajectoryPausedDialogIfNeeded(vioEngine.getTrajectoryPauseReason())
+            return
+        } else {
+            trajectoryPauseAcknowledged = false
         }
 
         // Allocate arrays with maximum expected size (MAX_TRAJECTORY_POINTS = 10000)
         val maxSize = 10000
         val positions = DoubleArray(maxSize * 3)
         val quaternions = DoubleArray(maxSize * 4)
-
         val trajectorySize = vioEngine.getTrajectoryData(positions, quaternions)
+
+        // Get current pose
+        val currentPos = DoubleArray(3)
+        val currentQuat = DoubleArray(4)
+        if (!vioEngine.getCurrentPose(currentPos, currentQuat)) {
+            if (trajectorySize > 0) {
+                val lastIndex = trajectorySize - 1
+                trajectoryView?.updateTrajectory(
+                    FloatArray(trajectorySize * 3) { positions[it].toFloat() },
+                    FloatArray(trajectorySize * 4) { quaternions[it].toFloat() },
+                    floatArrayOf(
+                        positions[lastIndex * 3].toFloat(),
+                        positions[lastIndex * 3 + 1].toFloat(),
+                        positions[lastIndex * 3 + 2].toFloat()
+                    ),
+                    floatArrayOf(
+                        quaternions[lastIndex * 4].toFloat(),
+                        quaternions[lastIndex * 4 + 1].toFloat(),
+                        quaternions[lastIndex * 4 + 2].toFloat(),
+                        quaternions[lastIndex * 4 + 3].toFloat()
+                    )
+                )
+            }
+            return // System not initialized
+        }
 
         if (trajectorySize == 0) {
             // Empty trajectory or error
@@ -429,6 +457,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         val currPosFloats = FloatArray(3) { currentPos[it].toFloat() }
         val currQuatFloats = FloatArray(4) { currentQuat[it].toFloat() }
 
+//        当前数据是否飘移
         val shifting = trajectoryRevisitor.shiftingTrajectory(
             currentPos, currentQuat
         )
@@ -464,6 +493,42 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
 
         // Update the 3D view
         trajectoryView?.updateTrajectory(posFloats, quatFloats, currPosFloats, currQuatFloats)
+    }
+
+    private fun showTrajectoryPausedDialogIfNeeded(reason: Int) {
+        if (trajectoryPauseDialogShowing || trajectoryPauseAcknowledged) return
+
+        trajectoryPauseDialogShowing = true
+        AlertDialog.Builder(this)
+            .setTitle("轨迹疑似漂移")
+            .setMessage("检测到轨迹数据异常，已暂停轨迹记录与绘制。\n\n原因：${trajectoryPauseReasonText(reason)}\n\n是否继续接着上次轨迹记录与绘制？")
+            .setPositiveButton("继续") { dialog, _ ->
+                vioEngine.resumeTrajectory()
+                trajectoryPauseAcknowledged = false
+                trajectoryPauseDialogShowing = false
+                dialog.dismiss()
+            }
+            .setNegativeButton("暂不继续") { dialog, _ ->
+                trajectoryPauseAcknowledged = true
+                trajectoryPauseDialogShowing = false
+                dialog.dismiss()
+            }
+            .setOnCancelListener {
+                trajectoryPauseAcknowledged = true
+                trajectoryPauseDialogShowing = false
+            }
+            .show()
+    }
+
+    private fun trajectoryPauseReasonText(reason: Int): String {
+        return when (reason) {
+            3 -> "单帧跳变过大"
+            4 -> "移动速度异常过快"
+            7 -> "转身后出现反向位移"
+            8 -> "转身后速度异常"
+            9 -> "转身后特征点偏少且跳动较大"
+            else -> "轨迹点连续异常"
+        }
     }
 
     private fun checkCurrentPost() {

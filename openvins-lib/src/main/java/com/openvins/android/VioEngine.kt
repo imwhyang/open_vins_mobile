@@ -135,6 +135,18 @@ class VioEngine {
         return getTrajectoryDataJNI(positions, quaternions)
     }
 
+    fun isTrajectoryPaused(): Boolean {
+        return isTrajectoryPausedJNI()
+    }
+
+    fun getTrajectoryPauseReason(): Int {
+        return getTrajectoryPauseReasonJNI()
+    }
+
+    fun resumeTrajectory() {
+        resumeTrajectoryJNI()
+    }
+
     /**
      * 将 YUV_420_888 格式的图像数据转换为 RGBA Mat。
      * @return 新分配的 Mat 对象内存地址，0 表示失败
@@ -180,6 +192,9 @@ class VioEngine {
     )
     private external fun getCurrentPoseJNI(position: DoubleArray, quaternion: DoubleArray): Boolean
     private external fun getTrajectoryDataJNI(positions: DoubleArray, quaternions: DoubleArray): Int
+    private external fun isTrajectoryPausedJNI(): Boolean
+    private external fun getTrajectoryPauseReasonJNI(): Int
+    private external fun resumeTrajectoryJNI()
     private external fun processYUVToRGBAJNI(
         yData: ByteArray?, uData: ByteArray?, vData: ByteArray?,
         width: Int, height: Int,
