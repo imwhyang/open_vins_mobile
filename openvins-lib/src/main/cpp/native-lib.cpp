@@ -152,11 +152,17 @@ const double TRAJECTORY_TURN_GUARD_LOW_FEATURE_STEP_METERS = 0.12;
 const size_t TRAJECTORY_TURN_GUARD_LOW_FEATURES = 80;
 const double TRAJECTORY_SHIFT_WINDOW_SECONDS = 0.5;
 const double TRAJECTORY_SHIFT_MAX_MILEAGE_METERS = 1.0;
-const double TRAJECTORY_MAX_CONNECT_STEP_METERS = 0.25;
+const double TRAJECTORY_MAX_CONNECT_STEP_METERS = 0.45;
 const double TRAJECTORY_TURN_IN_PLACE_ROT_RAD = 0.12;
 const double TRAJECTORY_TURN_IN_PLACE_MAX_STEP_METERS = 0.08;
+const double TRAJECTORY_TURN_PROTECT_ROT_RAD = 0.04;
+const double TRAJECTORY_TURN_PROTECT_SECONDS = 0.8;
+const double TRAJECTORY_TURN_PROTECT_MAX_END_DISTANCE = 0.18;
+const double TRAJECTORY_STRONG_TURN_ROT_RAD = 0.10;
+const double TRAJECTORY_STRONG_TURN_PROTECT_SECONDS = 0.45;
 const double TRAJECTORY_RESUME_STABLE_STEP_METERS = 0.12;
 const size_t TRAJECTORY_RESUME_STABLE_FRAMES = 5;
+const size_t TRAJECTORY_DRIFT_PAUSE_STREAK = 3;
 
 enum TrajectoryRejectReason {
   TRAJECTORY_REJECT_NONE = 0,
@@ -184,6 +190,8 @@ bool trajectory_resume_grace_pending = false;
 double trajectory_resume_grace_until_timestamp = -1.0;
 bool trajectory_resume_waiting_stable = false;
 size_t trajectory_resume_stable_count = 0;
+double trajectory_turn_protect_until_timestamp = -1.0;
+double trajectory_strong_turn_protect_until_timestamp = -1.0;
 
 struct TrajectoryShiftSample {
   double timestamp;
@@ -318,9 +326,9 @@ bool is_trajectory_drift_reason(int reject_reason) {
 }
 
 bool should_pause_for_trajectory_drift(int reject_reason) {
-  // 当前漂移检测已经改为 shiftingTrajectory 的窗口里程逻辑，命中后直接暂停。
+  // 弹窗只处理连续异常，避免正常转弯时的单帧/短暂假位移打断用户。
   (void)reject_reason;
-  return true;
+  return trajectory_drift_reject_streak >= TRAJECTORY_DRIFT_PAUSE_STREAK;
 }
 
 double trajectory_shifting_mileage_with_candidate(double timestamp, const Eigen::Vector3d &position) {
@@ -462,6 +470,40 @@ bool is_turning_in_place(const Eigen::Vector3d &position, const Eigen::Vector4d 
   return rot > TRAJECTORY_TURN_IN_PLACE_ROT_RAD && step < TRAJECTORY_TURN_IN_PLACE_MAX_STEP_METERS;
 }
 
+bool update_turn_protection(double timestamp, const Eigen::Vector3d &position, const Eigen::Vector4d &quaternion) {
+  if (!trajectory_debug_has_last_pose) {
+    return false;
+  }
+
+  double rot = trajectory_quaternion_angle(trajectory_debug_last_pose, quaternion(3), quaternion(0), quaternion(1), quaternion(2));
+  Eigen::Vector3d last_position;
+  bool has_last_position = get_last_trajectory_position(last_position);
+  double distance_from_end = has_last_position ? (position - last_position).norm() : 0.0;
+  bool close_to_trajectory_end = !has_last_position || distance_from_end <= TRAJECTORY_TURN_PROTECT_MAX_END_DISTANCE;
+
+  if (rot > TRAJECTORY_STRONG_TURN_ROT_RAD) {
+    // 快速 90/180 度转身时，VIO 可能瞬间产生较大的横向假位移。
+    // 这种情况下旋转信号优先，不再要求位置贴近终点，避免误弹漂移框。
+    trajectory_strong_turn_protect_until_timestamp =
+        std::max(trajectory_strong_turn_protect_until_timestamp, timestamp + TRAJECTORY_STRONG_TURN_PROTECT_SECONDS);
+    trajectory_turn_protect_until_timestamp = std::max(trajectory_turn_protect_until_timestamp, timestamp + TRAJECTORY_TURN_PROTECT_SECONDS);
+  } else if (rot > TRAJECTORY_TURN_PROTECT_ROT_RAD && close_to_trajectory_end) {
+    // 只有“正在转向且仍贴近轨迹终点”才进入保护期。
+    // 正常向前移动时会离开终点，不能继续静默过滤，否则轨迹会不绘制。
+    trajectory_turn_protect_until_timestamp = std::max(trajectory_turn_protect_until_timestamp, timestamp + TRAJECTORY_TURN_PROTECT_SECONDS);
+  }
+
+  if (timestamp <= trajectory_strong_turn_protect_until_timestamp) {
+    return true;
+  }
+
+  if (timestamp > trajectory_turn_protect_until_timestamp) {
+    return false;
+  }
+
+  return close_to_trajectory_end;
+}
+
 bool update_resume_stability(const Eigen::Vector3d &position) {
   Eigen::Vector3d last_position;
   if (!get_last_trajectory_position(last_position)) {
@@ -540,6 +582,8 @@ void reset_trajectory_debug_state() {
   trajectory_resume_grace_until_timestamp = -1.0;
   trajectory_resume_waiting_stable = false;
   trajectory_resume_stable_count = 0;
+  trajectory_turn_protect_until_timestamp = -1.0;
+  trajectory_strong_turn_protect_until_timestamp = -1.0;
   trajectory_shift_window.clear();
   trajectory_alignment_pending = false;
   trajectory_alignment_active = false;
@@ -830,9 +874,14 @@ void processing_worker_thread() {
         int reject_reason = TRAJECTORY_REJECT_NONE;
         bool accept_trajectory_point = false;
         if (!trajectory_data_paused) {
-          if (is_turning_in_place(p_traj, q_cam)) {
-            // 原地转身只更新方向锚点，不追加轨迹点，也不累计 shifting 里程。
-            // 这样 90/180 度转身不会被假位移误判成漂移。
+          bool turn_protected = update_turn_protection(state->_timestamp, p_traj, q_cam);
+          if (is_turning_in_place(p_traj, q_cam) || turn_protected) {
+            // 转弯保护期内只更新方向锚点，不追加轨迹点，也不累计 shifting 里程。
+            // 转弯产生的横向假位移会被静默过滤，不应该触发漂移弹窗。
+            Eigen::Vector3d last_position;
+            if (get_last_trajectory_position(last_position)) {
+              p_traj = last_position;
+            }
             remember_reliable_orientation(q_cam);
             trajectory_shift_window.clear();
             trajectory_drift_reject_streak = 0;
@@ -1750,6 +1799,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_resumeTraj
     trajectory_resume_grace_until_timestamp = -1.0;
     trajectory_resume_waiting_stable = true;
     trajectory_resume_stable_count = 0;
+    trajectory_turn_protect_until_timestamp = -1.0;
+    trajectory_strong_turn_protect_until_timestamp = -1.0;
     trajectory_shift_window.clear();
     trajectory_debug_last_timestamp = -1.0;
     trajectory_turn_guard_until_timestamp = -1.0;
