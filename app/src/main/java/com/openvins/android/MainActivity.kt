@@ -398,6 +398,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         if (trajectoryView == null) return
 
         if (vioEngine.isTrajectoryPaused()) {
+            updateTrajectoryViewWithLastReliablePose()
             showTrajectoryPausedDialogIfNeeded(vioEngine.getTrajectoryPauseReason())
             return
         } else {
@@ -492,6 +493,45 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
 
 
         // Update the 3D view
+        trajectoryView?.updateTrajectory(posFloats, quatFloats, currPosFloats, currQuatFloats)
+    }
+
+    private fun updateTrajectoryViewWithLastReliablePose() {
+        // 轨迹暂停时不要继续显示 VIO 的当前漂移位姿，方向框固定在最后一个可靠轨迹点上。
+        val maxSize = 10000
+        val positions = DoubleArray(maxSize * 3)
+        val quaternions = DoubleArray(maxSize * 4)
+        val trajectorySize = vioEngine.getTrajectoryData(positions, quaternions)
+        if (trajectorySize <= 0) return
+
+        val posFloats = FloatArray(trajectorySize * 3)
+        val quatFloats = FloatArray(trajectorySize * 4)
+        for (i in 0 until trajectorySize * 3) {
+            posFloats[i] = positions[i].toFloat()
+        }
+        for (i in 0 until trajectorySize * 4) {
+            quatFloats[i] = quaternions[i].toFloat()
+        }
+
+        val lastIndex = trajectorySize - 1
+        val currPosFloats = floatArrayOf(
+            positions[lastIndex * 3].toFloat(),
+            positions[lastIndex * 3 + 1].toFloat(),
+            positions[lastIndex * 3 + 2].toFloat()
+        )
+        val currentPos = DoubleArray(3)
+        val currentQuat = DoubleArray(4)
+        val currQuatFloats = if (vioEngine.getCurrentPose(currentPos, currentQuat)) {
+            // native 暂停状态下会返回最后可靠方向，避免原地转身后又显示成转身前方向。
+            FloatArray(4) { currentQuat[it].toFloat() }
+        } else {
+            floatArrayOf(
+                quaternions[lastIndex * 4].toFloat(),
+                quaternions[lastIndex * 4 + 1].toFloat(),
+                quaternions[lastIndex * 4 + 2].toFloat(),
+                quaternions[lastIndex * 4 + 3].toFloat()
+            )
+        }
         trajectoryView?.updateTrajectory(posFloats, quatFloats, currPosFloats, currQuatFloats)
     }
 

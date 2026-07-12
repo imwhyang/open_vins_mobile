@@ -1,8 +1,8 @@
-#include <atomic>
 #include <algorithm>
+#include <atomic>
 #include <cassert>
-#include <condition_variable>
 #include <cmath>
+#include <condition_variable>
 #include <errno.h>
 #include <exception>
 #include <fstream>
@@ -150,6 +150,13 @@ const double TRAJECTORY_TURN_GUARD_FAST_SPEED_MPS = 1.5;
 const double TRAJECTORY_TURN_GUARD_FAST_STEP_METERS = 0.05;
 const double TRAJECTORY_TURN_GUARD_LOW_FEATURE_STEP_METERS = 0.12;
 const size_t TRAJECTORY_TURN_GUARD_LOW_FEATURES = 80;
+const double TRAJECTORY_SHIFT_WINDOW_SECONDS = 0.5;
+const double TRAJECTORY_SHIFT_MAX_MILEAGE_METERS = 1.0;
+const double TRAJECTORY_MAX_CONNECT_STEP_METERS = 0.25;
+const double TRAJECTORY_TURN_IN_PLACE_ROT_RAD = 0.12;
+const double TRAJECTORY_TURN_IN_PLACE_MAX_STEP_METERS = 0.08;
+const double TRAJECTORY_RESUME_STABLE_STEP_METERS = 0.12;
+const size_t TRAJECTORY_RESUME_STABLE_FRAMES = 5;
 
 enum TrajectoryRejectReason {
   TRAJECTORY_REJECT_NONE = 0,
@@ -162,9 +169,9 @@ enum TrajectoryRejectReason {
   TRAJECTORY_REJECT_BACKWARD_AFTER_TURN = 7,
   TRAJECTORY_REJECT_FAST_AFTER_TURN = 8,
   TRAJECTORY_REJECT_LOW_FEATURE_TURN_JUMP = 9,
+  TRAJECTORY_REJECT_SHIFTING_WINDOW = 10,
 };
-const size_t TRAJECTORY_DRIFT_REJECT_STREAK = 3;
-
+const double TRAJECTORY_RESUME_GRACE_SECONDS = 2.0;
 double trajectory_debug_last_timestamp = -1.0;
 double trajectory_turn_guard_until_timestamp = -1.0;
 bool trajectory_debug_has_last_pose = false;
@@ -173,10 +180,28 @@ bool trajectory_data_paused = false;
 bool trajectory_pause_prompt_pending = false;
 int trajectory_pause_reason = TRAJECTORY_REJECT_NONE;
 size_t trajectory_drift_reject_streak = 0;
+bool trajectory_resume_grace_pending = false;
+double trajectory_resume_grace_until_timestamp = -1.0;
+bool trajectory_resume_waiting_stable = false;
+size_t trajectory_resume_stable_count = 0;
+
+struct TrajectoryShiftSample {
+  double timestamp;
+  Eigen::Vector3d position;
+  size_t history_size_after_append;
+};
+std::deque<TrajectoryShiftSample> trajectory_shift_window;
 bool trajectory_alignment_pending = false;
 bool trajectory_alignment_active = false;
 Eigen::Vector3d trajectory_alignment_anchor(0.0, 0.0, 0.0);
 Eigen::Vector3d trajectory_alignment_offset(0.0, 0.0, 0.0);
+Eigen::Vector3d trajectory_alignment_source_position(0.0, 0.0, 0.0);
+Eigen::Matrix3d trajectory_alignment_rotation = Eigen::Matrix3d::Identity();
+size_t trajectory_last_clean_size = 0;
+bool trajectory_has_clean_anchor = false;
+TrajectoryPoint trajectory_clean_anchor(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0);
+bool trajectory_has_reliable_orientation = false;
+Eigen::Vector4d trajectory_reliable_orientation(0.0, 0.0, 0.0, 1.0);
 
 double trajectory_quaternion_angle(const TrajectoryPoint &last, double qw, double qx, double qy, double qz) {
   double dot = std::abs(last.qw * qw + last.qx * qx + last.qy * qy + last.qz * qz);
@@ -202,8 +227,8 @@ double trajectory_forward_projection(const Eigen::Vector3d &position) {
   return delta.normalized().dot(camera_forward_in_global.normalized());
 }
 
-bool compute_trajectory_delta(double timestamp, const Eigen::Vector3d &position, const Eigen::Vector4d &quaternion, double &dt, double &step,
-                              double &speed, double &rot, double &forward_projection) {
+bool compute_trajectory_delta(double timestamp, const Eigen::Vector3d &position, const Eigen::Vector4d &quaternion, double &dt,
+                              double &step, double &speed, double &rot, double &forward_projection) {
   dt = 0.0;
   step = 0.0;
   speed = 0.0;
@@ -229,8 +254,8 @@ bool compute_trajectory_delta(double timestamp, const Eigen::Vector3d &position,
   return true;
 }
 
-bool should_accept_trajectory_point(double timestamp, const Eigen::Vector3d &position, const Eigen::Vector4d &quaternion, size_t feature_count,
-                                    int &reject_reason) {
+bool should_accept_trajectory_point(double timestamp, const Eigen::Vector3d &position, const Eigen::Vector4d &quaternion,
+                                    size_t feature_count, int &reject_reason) {
   reject_reason = TRAJECTORY_REJECT_NONE;
 
   double dt = 0.0;
@@ -272,8 +297,7 @@ bool should_accept_trajectory_point(double timestamp, const Eigen::Vector3d &pos
     reject_reason = TRAJECTORY_REJECT_ROTATION_LOW_FEATURE_JUMP;
     return false;
   }
-  if (turn_guard_active && step > TRAJECTORY_TURN_GUARD_MIN_STEP_METERS &&
-      forward_projection < TRAJECTORY_TURN_GUARD_BACKWARD_PROJECTION) {
+  if (turn_guard_active && step > TRAJECTORY_TURN_GUARD_MIN_STEP_METERS && forward_projection < TRAJECTORY_TURN_GUARD_BACKWARD_PROJECTION) {
     reject_reason = TRAJECTORY_REJECT_BACKWARD_AFTER_TURN;
     return false;
   }
@@ -281,8 +305,7 @@ bool should_accept_trajectory_point(double timestamp, const Eigen::Vector3d &pos
     reject_reason = TRAJECTORY_REJECT_FAST_AFTER_TURN;
     return false;
   }
-  if (turn_guard_active && step > TRAJECTORY_TURN_GUARD_LOW_FEATURE_STEP_METERS &&
-      feature_count < TRAJECTORY_TURN_GUARD_LOW_FEATURES) {
+  if (turn_guard_active && step > TRAJECTORY_TURN_GUARD_LOW_FEATURE_STEP_METERS && feature_count < TRAJECTORY_TURN_GUARD_LOW_FEATURES) {
     reject_reason = TRAJECTORY_REJECT_LOW_FEATURE_TURN_JUMP;
     return false;
   }
@@ -291,12 +314,213 @@ bool should_accept_trajectory_point(double timestamp, const Eigen::Vector3d &pos
 }
 
 bool is_trajectory_drift_reason(int reject_reason) {
-  return reject_reason == TRAJECTORY_REJECT_LARGE_JUMP || reject_reason == TRAJECTORY_REJECT_HIGH_SPEED ||
-         reject_reason == TRAJECTORY_REJECT_BACKWARD_AFTER_TURN || reject_reason == TRAJECTORY_REJECT_FAST_AFTER_TURN ||
-         reject_reason == TRAJECTORY_REJECT_LOW_FEATURE_TURN_JUMP;
+  return reject_reason == TRAJECTORY_REJECT_SHIFTING_WINDOW;
+}
+
+bool should_pause_for_trajectory_drift(int reject_reason) {
+  // 当前漂移检测已经改为 shiftingTrajectory 的窗口里程逻辑，命中后直接暂停。
+  (void)reject_reason;
+  return true;
+}
+
+double trajectory_shifting_mileage_with_candidate(double timestamp, const Eigen::Vector3d &position) {
+  const double cutoff = timestamp - TRAJECTORY_SHIFT_WINDOW_SECONDS;
+  bool has_last = false;
+  Eigen::Vector3d last_position = Eigen::Vector3d::Zero();
+  double mileage = 0.0;
+
+  for (const auto &sample : trajectory_shift_window) {
+    if (sample.timestamp < cutoff) {
+      continue;
+    }
+    if (has_last) {
+      mileage += (sample.position - last_position).norm();
+    }
+    last_position = sample.position;
+    has_last = true;
+  }
+
+  if (has_last) {
+    mileage += (position - last_position).norm();
+  }
+  return mileage;
+}
+
+bool is_trajectory_shifting(double timestamp, const Eigen::Vector3d &position) {
+  // 与 Kotlin 里的 shiftingTrajectory 保持一致：只看最近 0.5 秒的累计里程，
+  // 不再用单帧速度、转弯方向等条件触发弹窗，避免转身时过于敏感。
+  return trajectory_shifting_mileage_with_candidate(timestamp, position) > TRAJECTORY_SHIFT_MAX_MILEAGE_METERS;
+}
+
+void remember_trajectory_shift_sample(double timestamp, const Eigen::Vector3d &position, size_t history_size_after_append) {
+  // 只把已经接受并绘制的可靠点放入窗口，避免被拒绝的漂移点污染后续判断。
+  const double cutoff = timestamp - TRAJECTORY_SHIFT_WINDOW_SECONDS;
+  while (!trajectory_shift_window.empty() && trajectory_shift_window.front().timestamp < cutoff) {
+    trajectory_shift_window.pop_front();
+  }
+  trajectory_shift_window.push_back({timestamp, position, history_size_after_append});
+}
+
+size_t rollback_size_for_shifting_window(double timestamp) {
+  const double cutoff = timestamp - TRAJECTORY_SHIFT_WINDOW_SECONDS;
+  for (const auto &sample : trajectory_shift_window) {
+    if (sample.timestamp >= cutoff) {
+      // 第一个落入漂移窗口的点也可能已经属于异常段，所以回退到它之前。
+      return sample.history_size_after_append > 0 ? sample.history_size_after_append - 1 : 0;
+    }
+  }
+  return trajectory_history.size();
+}
+
+void rollback_trajectory_after_shifting(double timestamp) {
+  // shiftingTrajectory 是窗口判断，触发时窗口内前几帧可能已经画出去了。
+  // 这里把轨迹回退到窗口开始前，保证继续时接在最后一个更可靠的点上。
+  size_t keep_size = rollback_size_for_shifting_window(timestamp);
+  if (keep_size < trajectory_history.size()) {
+    trajectory_history.erase(trajectory_history.begin() + keep_size, trajectory_history.end());
+  }
+
+  trajectory_shift_window.clear();
+  if (!trajectory_history.empty()) {
+    trajectory_has_clean_anchor = true;
+    trajectory_last_clean_size = trajectory_history.size();
+    trajectory_clean_anchor = trajectory_history.back();
+    trajectory_reliable_orientation << trajectory_clean_anchor.qx, trajectory_clean_anchor.qy, trajectory_clean_anchor.qz, trajectory_clean_anchor.qw;
+    trajectory_has_reliable_orientation = true;
+  } else {
+    trajectory_has_clean_anchor = false;
+    trajectory_last_clean_size = 0;
+    trajectory_clean_anchor = TrajectoryPoint(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0);
+    trajectory_reliable_orientation << 0.0, 0.0, 0.0, 1.0;
+    trajectory_has_reliable_orientation = false;
+  }
+}
+
+void remember_reliable_orientation(const Eigen::Vector4d &quaternion) {
+  // 原地转身时位置可能几乎不变，但方向已经是可信的新方向。
+  // 继续对齐时要使用这个方向，避免 180 度转身后被拉回转身前朝向。
+  trajectory_reliable_orientation = quaternion;
+  trajectory_has_reliable_orientation = true;
+}
+
+Eigen::Vector4d trajectory_point_to_jpl_quat(const TrajectoryPoint &point) {
+  Eigen::Vector4d q;
+  q << point.qx, point.qy, point.qz, point.qw;
+  return q;
+}
+
+void apply_trajectory_alignment(Eigen::Vector3d &position, Eigen::Vector4d &quaternion) {
+  if (!trajectory_alignment_active) {
+    return;
+  }
+
+  // 继续后的 VIO 坐标系可能同时改变原点和朝向。trajectory_alignment_rotation
+  // 表示“新 VIO 全局坐标 -> 旧轨迹全局坐标”的旋转，所以位置用它左乘；
+  // 四元数是 GtoC，需要乘这个全局旋转的逆，才能和位置方向保持一致。
+  position = trajectory_alignment_anchor + trajectory_alignment_rotation * (position - trajectory_alignment_source_position);
+  Eigen::Matrix3d aligned_rotation = ov_core::quat_2_Rot(quaternion) * trajectory_alignment_rotation.transpose();
+  quaternion = ov_core::rot_2_quat(aligned_rotation);
+}
+
+bool get_last_trajectory_pose_for_display(Eigen::Vector3d &position, Eigen::Vector4d &quaternion) {
+  if (!trajectory_has_clean_anchor && trajectory_history.empty()) {
+    return false;
+  }
+
+  // 显示用位姿始终贴着轨迹线最后一个可靠点，避免暂停或重建 VIO 时方向框跳到漂移位置。
+  const TrajectoryPoint &anchor = trajectory_has_clean_anchor ? trajectory_clean_anchor : trajectory_history.back();
+  position = Eigen::Vector3d(anchor.x, anchor.y, anchor.z);
+  quaternion = trajectory_has_reliable_orientation ? trajectory_reliable_orientation : trajectory_point_to_jpl_quat(anchor);
+  return true;
+}
+
+bool get_last_trajectory_position(Eigen::Vector3d &position) {
+  if (trajectory_history.empty()) {
+    return false;
+  }
+  const auto &last = trajectory_history.back();
+  position = Eigen::Vector3d(last.x, last.y, last.z);
+  return true;
+}
+
+bool is_too_far_from_trajectory_end(const Eigen::Vector3d &position) {
+  Eigen::Vector3d last_position;
+  if (!get_last_trajectory_position(last_position)) {
+    return false;
+  }
+  return (position - last_position).norm() > TRAJECTORY_MAX_CONNECT_STEP_METERS;
+}
+
+bool is_turning_in_place(const Eigen::Vector3d &position, const Eigen::Vector4d &quaternion) {
+  if (!trajectory_debug_has_last_pose) {
+    return false;
+  }
+
+  double rot = trajectory_quaternion_angle(trajectory_debug_last_pose, quaternion(3), quaternion(0), quaternion(1), quaternion(2));
+  Eigen::Vector3d last_position(trajectory_debug_last_pose.x, trajectory_debug_last_pose.y, trajectory_debug_last_pose.z);
+  double step = (position - last_position).norm();
+  return rot > TRAJECTORY_TURN_IN_PLACE_ROT_RAD && step < TRAJECTORY_TURN_IN_PLACE_MAX_STEP_METERS;
+}
+
+bool update_resume_stability(const Eigen::Vector3d &position) {
+  Eigen::Vector3d last_position;
+  if (!get_last_trajectory_position(last_position)) {
+    trajectory_resume_waiting_stable = false;
+    trajectory_resume_stable_count = 0;
+    return true;
+  }
+
+  // 继续后先等待 VIO 的输出贴近旧轨迹终点，稳定前不记录、不弹窗。
+  if ((position - last_position).norm() <= TRAJECTORY_RESUME_STABLE_STEP_METERS) {
+    trajectory_resume_stable_count++;
+  } else {
+    trajectory_resume_stable_count = 0;
+  }
+
+  if (trajectory_resume_stable_count >= TRAJECTORY_RESUME_STABLE_FRAMES) {
+    trajectory_resume_waiting_stable = false;
+    trajectory_resume_stable_count = 0;
+    return true;
+  }
+  return false;
+}
+
+void rebase_alignment_to_trajectory_end(const Eigen::Vector3d &raw_position, const Eigen::Vector4d &raw_quaternion) {
+  Eigen::Vector3d anchor_position;
+  Eigen::Vector4d anchor_quaternion;
+  if (!get_last_trajectory_pose_for_display(anchor_position, anchor_quaternion)) {
+    return;
+  }
+
+  // 继续后的 VIO 偶尔第一帧仍然不稳定。如果对齐后的点离轨迹终点很远，
+  // 就用当前 raw 位姿重新建立“当前帧 -> 轨迹终点”的对齐关系，避免画长线。
+  trajectory_alignment_anchor = anchor_position;
+  trajectory_alignment_source_position = raw_position;
+  trajectory_alignment_rotation = ov_core::quat_2_Rot(anchor_quaternion).transpose() * ov_core::quat_2_Rot(raw_quaternion);
+  trajectory_alignment_offset = trajectory_alignment_anchor - trajectory_alignment_source_position;
+  trajectory_alignment_active = true;
+  trajectory_alignment_pending = false;
+}
+
+void set_pose_arrays(JNIEnv *env, jdoubleArray position, jdoubleArray quaternion, const Eigen::Vector3d &p, const Eigen::Vector4d &q_jpl) {
+  jdouble pos[3] = {p(0), p(1), p(2)};
+  // Java 层使用 Hamilton 顺序 [qw, qx, qy, qz]，native 内部保持 JPL 顺序 [qx, qy, qz, qw]。
+  jdouble quat[4] = {q_jpl(3), q_jpl(0), q_jpl(1), q_jpl(2)};
+  env->SetDoubleArrayRegion(position, 0, 3, pos);
+  env->SetDoubleArrayRegion(quaternion, 0, 4, quat);
 }
 
 void pause_trajectory_data(int reject_reason) {
+  // 当前被拒绝的点还没有写入 trajectory_history，因此历史轨迹会停在最后一个可靠点。
+  if (!trajectory_history.empty()) {
+    trajectory_has_clean_anchor = true;
+    trajectory_last_clean_size = trajectory_history.size();
+    trajectory_clean_anchor = trajectory_history.back();
+  } else {
+    trajectory_has_clean_anchor = false;
+    trajectory_last_clean_size = 0;
+    trajectory_clean_anchor = TrajectoryPoint(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0);
+  }
   trajectory_data_paused = true;
   trajectory_pause_prompt_pending = true;
   trajectory_pause_reason = reject_reason;
@@ -312,10 +536,22 @@ void reset_trajectory_debug_state() {
   trajectory_pause_prompt_pending = false;
   trajectory_pause_reason = TRAJECTORY_REJECT_NONE;
   trajectory_drift_reject_streak = 0;
+  trajectory_resume_grace_pending = false;
+  trajectory_resume_grace_until_timestamp = -1.0;
+  trajectory_resume_waiting_stable = false;
+  trajectory_resume_stable_count = 0;
+  trajectory_shift_window.clear();
   trajectory_alignment_pending = false;
   trajectory_alignment_active = false;
   trajectory_alignment_anchor = Eigen::Vector3d::Zero();
   trajectory_alignment_offset = Eigen::Vector3d::Zero();
+  trajectory_alignment_source_position = Eigen::Vector3d::Zero();
+  trajectory_alignment_rotation = Eigen::Matrix3d::Identity();
+  trajectory_last_clean_size = 0;
+  trajectory_has_clean_anchor = false;
+  trajectory_clean_anchor = TrajectoryPoint(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0);
+  trajectory_has_reliable_orientation = false;
+  trajectory_reliable_orientation << 0.0, 0.0, 0.0, 1.0;
 }
 
 void record_trajectory_debug(double timestamp, const Eigen::Vector3d &position, const Eigen::Vector4d &quaternion, size_t trajectory_size,
@@ -340,15 +576,16 @@ void record_trajectory_debug(double timestamp, const Eigen::Vector3d &position, 
 
   if (trajectory_debug_csv.is_open()) {
     trajectory_debug_csv << std::fixed << std::setprecision(9) << timestamp << "," << trajectory_size << "," << position(0) << ","
-                         << position(1) << "," << position(2) << "," << qx << "," << qy << "," << qz << "," << qw << "," << dt
-                         << "," << step << "," << speed << "," << rot << "," << feature_count << "," << (zupt_active ? 1 : 0) << ","
-                         << forward_projection << "," << (turn_guard_active ? 1 : 0) << "," << (accepted ? 1 : 0) << ","
-                         << reject_reason << "," << (anomaly ? 1 : 0) << std::endl;
+                         << position(1) << "," << position(2) << "," << qx << "," << qy << "," << qz << "," << qw << "," << dt << ","
+                         << step << "," << speed << "," << rot << "," << feature_count << "," << (zupt_active ? 1 : 0) << ","
+                         << forward_projection << "," << (turn_guard_active ? 1 : 0) << "," << (accepted ? 1 : 0) << "," << reject_reason
+                         << "," << (anomaly ? 1 : 0) << std::endl;
   }
 
   if (anomaly || !accepted) {
     __android_log_print(ANDROID_LOG_WARN, TAG,
-                        "Trajectory point: t=%.6f dt=%.4f step=%.3f speed=%.3f rot_deg=%.1f forward=%.2f guard=%d features=%zu zupt=%d accepted=%d reason=%d size=%zu\n",
+                        "Trajectory point: t=%.6f dt=%.4f step=%.3f speed=%.3f rot_deg=%.1f forward=%.2f guard=%d features=%zu zupt=%d "
+                        "accepted=%d reason=%d size=%zu\n",
                         timestamp, dt, step, speed, rot * 180.0 / M_PI, forward_projection, turn_guard_active ? 1 : 0, feature_count,
                         zupt_active ? 1 : 0, accepted ? 1 : 0, reject_reason, trajectory_size);
   }
@@ -551,35 +788,96 @@ void processing_worker_thread() {
         // q_cam is JPL format [qx, qy, qz, qw], but TrajectoryPoint expects [qw, qx, qy, qz]
         std::lock_guard<std::mutex> traj_lck(trajectory_mtx);
         Eigen::Vector3d p_traj = p_cam;
+        Eigen::Vector3d p_raw_for_alignment = p_cam;
+        Eigen::Vector4d q_raw_for_alignment = q_cam;
         if (trajectory_alignment_pending) {
           Eigen::Vector3d alignment_anchor = trajectory_alignment_anchor;
-          Eigen::Vector3d alignment_offset = alignment_anchor - p_cam;
-          reset_trajectory_debug_state();
+          Eigen::Vector4d anchor_quat =
+              trajectory_has_reliable_orientation ? trajectory_reliable_orientation
+                                                  : (trajectory_has_clean_anchor ? trajectory_point_to_jpl_quat(trajectory_clean_anchor) : q_cam);
+          Eigen::Matrix3d source_rotation = ov_core::quat_2_Rot(q_cam);
+          Eigen::Matrix3d anchor_rotation = ov_core::quat_2_Rot(anchor_quat);
+          // 继续后 VIO 会进入新的局部坐标系。这里记录“新起点 -> 最后可靠点”的
+          // 位置和朝向差，后续每个点都用同一个刚体变换接到旧轨迹上。
+          trajectory_debug_last_timestamp = -1.0;
+          trajectory_turn_guard_until_timestamp = -1.0;
+          trajectory_debug_has_last_pose = false;
+          trajectory_debug_last_pose = TrajectoryPoint(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0);
+          trajectory_shift_window.clear();
           trajectory_alignment_anchor = alignment_anchor;
-          trajectory_alignment_offset = alignment_offset;
+          trajectory_alignment_source_position = p_cam;
+          trajectory_alignment_rotation = anchor_rotation.transpose() * source_rotation;
+          trajectory_alignment_offset = trajectory_alignment_anchor - trajectory_alignment_source_position;
           trajectory_alignment_active = true;
           trajectory_alignment_pending = false;
         }
-        if (trajectory_alignment_active) {
-          p_traj = p_cam + trajectory_alignment_offset;
+        apply_trajectory_alignment(p_traj, q_cam);
+        if (trajectory_resume_grace_pending) {
+          // 刚继续或重新初始化时，OpenVINS 可能有少量稳定过程。
+          // 保护期内仍然丢弃异常点，但不立刻弹窗打断用户。
+          trajectory_resume_grace_until_timestamp = state->_timestamp + TRAJECTORY_RESUME_GRACE_SECONDS;
+          trajectory_resume_grace_pending = false;
+        }
+        bool suppress_pause_prompt = state->_timestamp <= trajectory_resume_grace_until_timestamp;
+        if (trajectory_alignment_active && (suppress_pause_prompt || trajectory_resume_waiting_stable) && is_too_far_from_trajectory_end(p_traj)) {
+          rebase_alignment_to_trajectory_end(p_raw_for_alignment, q_raw_for_alignment);
+          p_traj = p_raw_for_alignment;
+          q_cam = q_raw_for_alignment;
+          apply_trajectory_alignment(p_traj, q_cam);
         }
         size_t feature_count = local_sys->get_last_track_count();
         bool zupt_active = local_sys->last_update_used_zupt();
         int reject_reason = TRAJECTORY_REJECT_NONE;
         bool accept_trajectory_point = false;
         if (!trajectory_data_paused) {
-          accept_trajectory_point = should_accept_trajectory_point(state->_timestamp, p_traj, q_cam, feature_count, reject_reason);
+          if (is_turning_in_place(p_traj, q_cam)) {
+            // 原地转身只更新方向锚点，不追加轨迹点，也不累计 shifting 里程。
+            // 这样 90/180 度转身不会被假位移误判成漂移。
+            remember_reliable_orientation(q_cam);
+            trajectory_shift_window.clear();
+            trajectory_drift_reject_streak = 0;
+          } else if (trajectory_resume_waiting_stable) {
+            // 点击继续后先等 VIO 连续几帧贴近旧轨迹终点，稳定前不绘制、不弹窗。
+            if (update_resume_stability(p_traj)) {
+              trajectory_debug_last_timestamp = -1.0;
+              trajectory_debug_has_last_pose = false;
+              trajectory_shift_window.clear();
+              accept_trajectory_point = true;
+            }
+          } else if (is_too_far_from_trajectory_end(p_traj)) {
+            // 无论漂移窗口是否触发，相邻绘制点都不能直接连接到很远的位置。
+            reject_reason = TRAJECTORY_REJECT_SHIFTING_WINDOW;
+          } else if (is_trajectory_shifting(state->_timestamp, p_traj)) {
+            reject_reason = TRAJECTORY_REJECT_SHIFTING_WINDOW;
+            rollback_trajectory_after_shifting(state->_timestamp);
+          } else {
+            accept_trajectory_point = true;
+          }
         }
         if (accept_trajectory_point) {
           trajectory_history.emplace_back(p_traj(0), p_traj(1), p_traj(2), q_cam(3), q_cam(0), q_cam(1), q_cam(2));
           if (trajectory_history.size() > MAX_TRAJECTORY_POINTS) {
             trajectory_history.erase(trajectory_history.begin());
+            if (trajectory_last_clean_size > 0) {
+              trajectory_last_clean_size--;
+            }
           }
+          trajectory_has_clean_anchor = true;
+          trajectory_last_clean_size = trajectory_history.size();
+          trajectory_clean_anchor = trajectory_history.back();
+          remember_trajectory_shift_sample(state->_timestamp, p_traj, trajectory_history.size());
+          remember_reliable_orientation(q_cam);
           trajectory_drift_reject_streak = 0;
         } else if (!trajectory_data_paused && is_trajectory_drift_reason(reject_reason)) {
-          trajectory_drift_reject_streak++;
-          if (trajectory_drift_reject_streak >= TRAJECTORY_DRIFT_REJECT_STREAK) {
-            pause_trajectory_data(reject_reason);
+          // 漂移候选点不会写入 trajectory_history。即使恢复保护期内不弹窗，
+          // 可视轨迹也会停在最后一个可靠点，不会把异常点连成线。
+          if (suppress_pause_prompt) {
+            trajectory_drift_reject_streak = 0;
+          } else {
+            trajectory_drift_reject_streak++;
+            if (should_pause_for_trajectory_drift(reject_reason)) {
+              pause_trajectory_data(reject_reason);
+            }
           }
         } else if (!trajectory_data_paused) {
           trajectory_drift_reject_streak = 0;
@@ -588,8 +886,8 @@ void processing_worker_thread() {
           accept_trajectory_point = false;
           reject_reason = trajectory_pause_reason;
         }
-        record_trajectory_debug(state->_timestamp, p_traj, q_cam, trajectory_history.size(), feature_count, zupt_active, accept_trajectory_point,
-                                reject_reason);
+        record_trajectory_debug(state->_timestamp, p_traj, q_cam, trajectory_history.size(), feature_count, zupt_active,
+                                accept_trajectory_point, reject_reason);
 
         // Display the current state
         std::stringstream ss1, ss2, ss3;
@@ -682,9 +980,9 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setRecordS
 
     std::string trajectory_debug_csv_name = s + "trajectory_debug.csv";
     trajectory_debug_csv.open(save_folder + trajectory_debug_csv_name);
-    trajectory_debug_csv
-        << "timestamp,trajectory_size,p_x,p_y,p_z,q_x,q_y,q_z,q_w,dt,step_m,speed_mps,rot_rad,feature_count,zupt_active,forward_projection,turn_guard_active,accepted,reject_reason,anomaly"
-        << std::endl;
+    trajectory_debug_csv << "timestamp,trajectory_size,p_x,p_y,p_z,q_x,q_y,q_z,q_w,dt,step_m,speed_mps,rot_rad,feature_count,zupt_active,"
+                            "forward_projection,turn_guard_active,accepted,reject_reason,anomaly"
+                         << std::endl;
     reset_trajectory_debug_state();
   } else {
 
@@ -1194,7 +1492,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIma
 
   // Update visualization image cache (used by getDisplayImageJNI for overlays)
   // This is separate from the actual processing - just updating the cache
-    if (viz_time == -1 || (time_in_sec - viz_time) > 1.0 / viz_rate) {
+  if (viz_time == -1 || (time_in_sec - viz_time) > 1.0 / viz_rate) {
     cv::Mat temp_img;
     if (local_sys != nullptr) {
       temp_img = local_sys->get_historical_viz_image();
@@ -1247,9 +1545,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIne
 
     if (hard_spike || jump_spike) {
       if (imu_filter_initialized && dt > 0.0 && dt < IMU_FILTER_RESET_DT) {
-        __android_log_print(ANDROID_LOG_WARN, TAG,
-                            "Replacing IMU spike at %.9f: acc_norm=%.3f gyro_norm=%.3f hard=%d jump=%d\n", time_in_sec, accel_norm,
-                            gyro_norm, hard_spike ? 1 : 0, jump_spike ? 1 : 0);
+        __android_log_print(ANDROID_LOG_WARN, TAG, "Replacing IMU spike at %.9f: acc_norm=%.3f gyro_norm=%.3f hard=%d jump=%d\n",
+                            time_in_sec, accel_norm, gyro_norm, hard_spike ? 1 : 0, jump_spike ? 1 : 0);
         n_ax = last_valid_ax;
         n_ay = last_valid_ay;
         n_az = last_valid_az;
@@ -1258,9 +1555,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIne
         n_gz = last_valid_gz;
         last_valid_imu_timestamp = time_in_sec;
       } else {
-        __android_log_print(ANDROID_LOG_WARN, TAG,
-                            "Dropping IMU spike at %.9f: acc_norm=%.3f gyro_norm=%.3f hard=%d jump=%d\n", time_in_sec, accel_norm,
-                            gyro_norm, hard_spike ? 1 : 0, jump_spike ? 1 : 0);
+        __android_log_print(ANDROID_LOG_WARN, TAG, "Dropping IMU spike at %.9f: acc_norm=%.3f gyro_norm=%.3f hard=%d jump=%d\n",
+                            time_in_sec, accel_norm, gyro_norm, hard_spike ? 1 : 0, jump_spike ? 1 : 0);
         imu_sample_valid = false;
       }
     } else {
@@ -1333,6 +1629,13 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_openvins_android_VioEngine_getCur
   }
 
   if (local_sys == nullptr || !is_running_ov) {
+    std::lock_guard<std::mutex> traj_lck(trajectory_mtx);
+    Eigen::Vector3d display_position;
+    Eigen::Vector4d display_quaternion;
+    if (get_last_trajectory_pose_for_display(display_position, display_quaternion)) {
+      set_pose_arrays(env, position, quaternion, display_position, display_quaternion);
+      return JNI_TRUE;
+    }
     return JNI_FALSE;
   }
 
@@ -1358,17 +1661,14 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_openvins_android_VioEngine_getCur
   Eigen::Vector3d p_cam = p_IinG - ov_core::quat_2_Rot(q_cam).transpose() * p_IinC;
   {
     std::lock_guard<std::mutex> traj_lck(trajectory_mtx);
-    if (trajectory_alignment_active) {
-      p_cam = p_cam + trajectory_alignment_offset;
-    } else if (trajectory_alignment_pending && !trajectory_history.empty()) {
-      const auto &last = trajectory_history.back();
-      p_cam = Eigen::Vector3d(last.x, last.y, last.z);
+    if (trajectory_data_paused || trajectory_alignment_pending || trajectory_resume_waiting_stable) {
+      // 暂停或等待继续对齐时，方向框固定在轨迹线最后一点。
+      // 只有第一帧对齐完成后，才重新显示经过刚体变换后的 VIO 当前位姿。
+      get_last_trajectory_pose_for_display(p_cam, q_cam);
+    } else if (trajectory_alignment_active) {
+      apply_trajectory_alignment(p_cam, q_cam);
     }
   }
-
-  jdouble pos[3] = {p_cam(0), p_cam(1), p_cam(2)};
-  // Convert JPL [qx, qy, qz, qw] to Hamilton [qw, qx, qy, qz] for Java
-  jdouble quat[4] = {q_cam(3), q_cam(0), q_cam(1), q_cam(2)};
 
   if (is_recording && pose_ext_csv.is_open()) {
     unsigned long long time_in_ns = (unsigned long long)(state->_timestamp * 1e9);
@@ -1376,8 +1676,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_openvins_android_VioEngine_getCur
                  << q_cam(2) << "," << q_cam(3) << std::endl;
   }
 
-  env->SetDoubleArrayRegion(position, 0, 3, pos);
-  env->SetDoubleArrayRegion(quaternion, 0, 4, quat);
+  set_pose_arrays(env, position, quaternion, p_cam, q_cam);
 
   return JNI_TRUE;
 }
@@ -1447,27 +1746,44 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_resumeTraj
     trajectory_pause_prompt_pending = false;
     trajectory_pause_reason = TRAJECTORY_REJECT_NONE;
     trajectory_drift_reject_streak = 0;
+    trajectory_resume_grace_pending = true;
+    trajectory_resume_grace_until_timestamp = -1.0;
+    trajectory_resume_waiting_stable = true;
+    trajectory_resume_stable_count = 0;
+    trajectory_shift_window.clear();
     trajectory_debug_last_timestamp = -1.0;
     trajectory_turn_guard_until_timestamp = -1.0;
     trajectory_debug_has_last_pose = false;
     trajectory_debug_last_pose = TrajectoryPoint(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0);
 
-    if (!trajectory_history.empty()) {
+    if (trajectory_has_clean_anchor) {
+      trajectory_alignment_anchor = Eigen::Vector3d(trajectory_clean_anchor.x, trajectory_clean_anchor.y, trajectory_clean_anchor.z);
+      trajectory_alignment_pending = true;
+      trajectory_alignment_active = false;
+      trajectory_alignment_offset = Eigen::Vector3d::Zero();
+      trajectory_alignment_source_position = Eigen::Vector3d::Zero();
+      trajectory_alignment_rotation = Eigen::Matrix3d::Identity();
+    } else if (!trajectory_history.empty()) {
       const auto &last = trajectory_history.back();
       trajectory_alignment_anchor = Eigen::Vector3d(last.x, last.y, last.z);
       trajectory_alignment_pending = true;
       trajectory_alignment_active = false;
       trajectory_alignment_offset = Eigen::Vector3d::Zero();
+      trajectory_alignment_source_position = Eigen::Vector3d::Zero();
+      trajectory_alignment_rotation = Eigen::Matrix3d::Identity();
     } else {
       trajectory_alignment_pending = false;
       trajectory_alignment_active = false;
       trajectory_alignment_anchor = Eigen::Vector3d::Zero();
       trajectory_alignment_offset = Eigen::Vector3d::Zero();
+      trajectory_alignment_source_position = Eigen::Vector3d::Zero();
+      trajectory_alignment_rotation = Eigen::Matrix3d::Identity();
     }
   }
 
   {
     std::lock_guard<std::mutex> sys_lck(sys_mtx);
+    // 重新创建 VIO，避免已经异常的估计状态在继续后沿着原来的方向继续漂。
     sys = nullptr;
   }
   {
