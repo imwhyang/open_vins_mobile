@@ -163,6 +163,9 @@ const double TRAJECTORY_STRONG_TURN_PROTECT_SECONDS = 0.45;
 const double TRAJECTORY_RESUME_STABLE_STEP_METERS = 0.12;
 const size_t TRAJECTORY_RESUME_STABLE_FRAMES = 5;
 const size_t TRAJECTORY_DRIFT_PAUSE_STREAK = 3;
+const double TRAJECTORY_CONSISTENT_DRIFT_MIN_STEP_METERS = 0.12;
+const double TRAJECTORY_CONSISTENT_DRIFT_DIRECTION_DOT = 0.85;
+const double TRAJECTORY_CONSISTENT_DRIFT_STEP_RATIO = 0.45;
 
 enum TrajectoryRejectReason {
   TRAJECTORY_REJECT_NONE = 0,
@@ -192,6 +195,9 @@ bool trajectory_resume_waiting_stable = false;
 size_t trajectory_resume_stable_count = 0;
 double trajectory_turn_protect_until_timestamp = -1.0;
 double trajectory_strong_turn_protect_until_timestamp = -1.0;
+bool trajectory_has_last_drift_delta = false;
+Eigen::Vector3d trajectory_last_drift_delta(0.0, 0.0, 0.0);
+size_t trajectory_consistent_drift_count = 0;
 
 struct TrajectoryShiftSample {
   double timestamp;
@@ -216,6 +222,8 @@ double trajectory_quaternion_angle(const TrajectoryPoint &last, double qw, doubl
   dot = std::min(1.0, std::max(-1.0, dot));
   return 2.0 * std::acos(dot);
 }
+
+bool get_last_trajectory_position(Eigen::Vector3d &position);
 
 double trajectory_forward_projection(const Eigen::Vector3d &position) {
   if (!trajectory_debug_has_last_pose) {
@@ -358,6 +366,47 @@ bool is_trajectory_shifting(double timestamp, const Eigen::Vector3d &position) {
   // 与 Kotlin 里的 shiftingTrajectory 保持一致：只看最近 0.5 秒的累计里程，
   // 不再用单帧速度、转弯方向等条件触发弹窗，避免转身时过于敏感。
   return trajectory_shifting_mileage_with_candidate(timestamp, position) > TRAJECTORY_SHIFT_MAX_MILEAGE_METERS;
+}
+
+void reset_consistent_drift_detector() {
+  trajectory_has_last_drift_delta = false;
+  trajectory_last_drift_delta = Eigen::Vector3d::Zero();
+  trajectory_consistent_drift_count = 0;
+}
+
+bool update_consistent_drift_detector(const Eigen::Vector3d &position) {
+  Eigen::Vector3d last_position;
+  if (!get_last_trajectory_position(last_position)) {
+    reset_consistent_drift_detector();
+    return false;
+  }
+
+  Eigen::Vector3d delta = position - last_position;
+  double step = delta.norm();
+  if (step < TRAJECTORY_CONSISTENT_DRIFT_MIN_STEP_METERS) {
+    reset_consistent_drift_detector();
+    return false;
+  }
+
+  if (!trajectory_has_last_drift_delta) {
+    trajectory_last_drift_delta = delta;
+    trajectory_has_last_drift_delta = true;
+    trajectory_consistent_drift_count = 1;
+    return false;
+  }
+
+  double last_step = trajectory_last_drift_delta.norm();
+  double direction_dot = delta.normalized().dot(trajectory_last_drift_delta.normalized());
+  double step_ratio = std::abs(step - last_step) / std::max(step, last_step);
+  if (direction_dot >= TRAJECTORY_CONSISTENT_DRIFT_DIRECTION_DOT && step_ratio <= TRAJECTORY_CONSISTENT_DRIFT_STEP_RATIO) {
+    trajectory_consistent_drift_count++;
+  } else {
+    trajectory_consistent_drift_count = 1;
+  }
+
+  trajectory_last_drift_delta = delta;
+  // 真漂移通常是连续几帧同方向、同量级地偏；转身抖动方向杂乱，不应触发弹窗。
+  return trajectory_consistent_drift_count >= TRAJECTORY_DRIFT_PAUSE_STREAK;
 }
 
 void remember_trajectory_shift_sample(double timestamp, const Eigen::Vector3d &position, size_t history_size_after_append) {
@@ -584,6 +633,7 @@ void reset_trajectory_debug_state() {
   trajectory_resume_stable_count = 0;
   trajectory_turn_protect_until_timestamp = -1.0;
   trajectory_strong_turn_protect_until_timestamp = -1.0;
+  reset_consistent_drift_detector();
   trajectory_shift_window.clear();
   trajectory_alignment_pending = false;
   trajectory_alignment_active = false;
@@ -875,9 +925,9 @@ void processing_worker_thread() {
         bool accept_trajectory_point = false;
         if (!trajectory_data_paused) {
           bool turn_protected = update_turn_protection(state->_timestamp, p_traj, q_cam);
-          if (is_turning_in_place(p_traj, q_cam) || turn_protected) {
-            // 转弯保护期内只更新方向锚点，不追加轨迹点，也不累计 shifting 里程。
-            // 转弯产生的横向假位移会被静默过滤，不应该触发漂移弹窗。
+          if (is_turning_in_place(p_traj, q_cam)) {
+            // 严格原地转身只更新方向锚点，不追加轨迹点。
+            // 普通转弯不能走这里，否则边走边转时会出现“方向框动、轨迹不画”。
             Eigen::Vector3d last_position;
             if (get_last_trajectory_position(last_position)) {
               p_traj = last_position;
@@ -885,21 +935,40 @@ void processing_worker_thread() {
             remember_reliable_orientation(q_cam);
             trajectory_shift_window.clear();
             trajectory_drift_reject_streak = 0;
+            reset_consistent_drift_detector();
           } else if (trajectory_resume_waiting_stable) {
             // 点击继续后先等 VIO 连续几帧贴近旧轨迹终点，稳定前不绘制、不弹窗。
             if (update_resume_stability(p_traj)) {
               trajectory_debug_last_timestamp = -1.0;
               trajectory_debug_has_last_pose = false;
               trajectory_shift_window.clear();
+              reset_consistent_drift_detector();
               accept_trajectory_point = true;
             }
+          } else if (turn_protected && !is_too_far_from_trajectory_end(p_traj)) {
+            // 转弯保护期内允许正常移动轨迹通过，但不累计 shifting 窗口，
+            // 避免转弯时的姿态变化被当成漂移。
+            trajectory_shift_window.clear();
+            reset_consistent_drift_detector();
+            accept_trajectory_point = true;
+          } else if (turn_protected && is_too_far_from_trajectory_end(p_traj)) {
+            // 转弯时如果 VIO 点跳得很远，静默丢弃该点，不弹窗也不画长线。
+            remember_reliable_orientation(q_cam);
+            trajectory_shift_window.clear();
+            trajectory_drift_reject_streak = 0;
+            reset_consistent_drift_detector();
           } else if (is_too_far_from_trajectory_end(p_traj)) {
-            // 无论漂移窗口是否触发，相邻绘制点都不能直接连接到很远的位置。
-            reject_reason = TRAJECTORY_REJECT_SHIFTING_WINDOW;
-          } else if (is_trajectory_shifting(state->_timestamp, p_traj)) {
-            reject_reason = TRAJECTORY_REJECT_SHIFTING_WINDOW;
-            rollback_trajectory_after_shifting(state->_timestamp);
+            // 距离异常先不弹窗，只有连续同方向、同量级偏移才认为是真漂移。
+            if (update_consistent_drift_detector(p_traj)) {
+              reject_reason = TRAJECTORY_REJECT_SHIFTING_WINDOW;
+            }
+          } else if (!turn_protected && is_trajectory_shifting(state->_timestamp, p_traj)) {
+            if (update_consistent_drift_detector(p_traj)) {
+              reject_reason = TRAJECTORY_REJECT_SHIFTING_WINDOW;
+              rollback_trajectory_after_shifting(state->_timestamp);
+            }
           } else {
+            reset_consistent_drift_detector();
             accept_trajectory_point = true;
           }
         }
@@ -1801,6 +1870,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_resumeTraj
     trajectory_resume_stable_count = 0;
     trajectory_turn_protect_until_timestamp = -1.0;
     trajectory_strong_turn_protect_until_timestamp = -1.0;
+    reset_consistent_drift_detector();
     trajectory_shift_window.clear();
     trajectory_debug_last_timestamp = -1.0;
     trajectory_turn_guard_until_timestamp = -1.0;
