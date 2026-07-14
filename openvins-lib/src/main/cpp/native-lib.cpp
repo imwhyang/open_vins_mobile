@@ -183,6 +183,7 @@ enum TrajectoryRejectReason {
 const double TRAJECTORY_RESUME_GRACE_SECONDS = 2.0;
 double trajectory_debug_last_timestamp = -1.0;
 double trajectory_turn_guard_until_timestamp = -1.0;
+size_t trajectory_debug_session_start_size = 0;
 bool trajectory_debug_has_last_pose = false;
 TrajectoryPoint trajectory_debug_last_pose(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0);
 bool trajectory_data_paused = false;
@@ -621,6 +622,7 @@ void pause_trajectory_data(int reject_reason) {
 void reset_trajectory_debug_state() {
   trajectory_debug_last_timestamp = -1.0;
   trajectory_turn_guard_until_timestamp = -1.0;
+  trajectory_debug_session_start_size = 0;
   trajectory_debug_has_last_pose = false;
   trajectory_debug_last_pose = TrajectoryPoint(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0);
   trajectory_data_paused = false;
@@ -662,6 +664,16 @@ void record_trajectory_debug(double timestamp, const Eigen::Vector3d &position, 
   double forward_projection = 0.0;
   bool anomaly = false;
   bool turn_guard_active = timestamp <= trajectory_turn_guard_until_timestamp;
+  Eigen::Vector3d trajectory_end;
+  bool has_trajectory_end = get_last_trajectory_position(trajectory_end);
+  double distance_to_trajectory_end = has_trajectory_end ? (position - trajectory_end).norm() : 0.0;
+  double shifting_mileage = trajectory_shifting_mileage_with_candidate(timestamp, position);
+  bool turning_in_place = is_turning_in_place(position, quaternion);
+  bool turn_protect_active = timestamp <= trajectory_turn_protect_until_timestamp;
+  bool strong_turn_protect_active = timestamp <= trajectory_strong_turn_protect_until_timestamp;
+  size_t session_trajectory_size = trajectory_size >= trajectory_debug_session_start_size
+                                       ? trajectory_size - trajectory_debug_session_start_size
+                                       : 0;
 
   if (compute_trajectory_delta(timestamp, position, quaternion, dt, step, speed, rot, forward_projection)) {
     anomaly = dt <= 0.0 || step > TRAJECTORY_DEBUG_JUMP_METERS || speed > TRAJECTORY_DEBUG_SPEED_MPS ||
@@ -673,7 +685,10 @@ void record_trajectory_debug(double timestamp, const Eigen::Vector3d &position, 
                          << position(1) << "," << position(2) << "," << qx << "," << qy << "," << qz << "," << qw << "," << dt << ","
                          << step << "," << speed << "," << rot << "," << feature_count << "," << (zupt_active ? 1 : 0) << ","
                          << forward_projection << "," << (turn_guard_active ? 1 : 0) << "," << (accepted ? 1 : 0) << "," << reject_reason
-                         << "," << (anomaly ? 1 : 0) << std::endl;
+                         << "," << (anomaly ? 1 : 0) << "," << session_trajectory_size << "," << distance_to_trajectory_end
+                         << "," << shifting_mileage << "," << (turning_in_place ? 1 : 0) << "," << (turn_protect_active ? 1 : 0)
+                         << "," << (strong_turn_protect_active ? 1 : 0) << "," << (trajectory_resume_waiting_stable ? 1 : 0)
+                         << "," << trajectory_resume_stable_count << "," << trajectory_consistent_drift_count << std::endl;
   }
 
   if (anomaly || !accepted) {
@@ -1099,9 +1114,16 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setRecordS
     std::string trajectory_debug_csv_name = s + "trajectory_debug.csv";
     trajectory_debug_csv.open(save_folder + trajectory_debug_csv_name);
     trajectory_debug_csv << "timestamp,trajectory_size,p_x,p_y,p_z,q_x,q_y,q_z,q_w,dt,step_m,speed_mps,rot_rad,feature_count,zupt_active,"
-                            "forward_projection,turn_guard_active,accepted,reject_reason,anomaly"
+                            "forward_projection,turn_guard_active,accepted,reject_reason,anomaly,session_trajectory_size,"
+                            "distance_to_trajectory_end_m,shifting_mileage_m,turning_in_place,turn_protect_active,"
+                            "strong_turn_protect_active,resume_waiting_stable,resume_stable_count,consistent_drift_count"
                          << std::endl;
     reset_trajectory_debug_state();
+    {
+      std::lock_guard<std::mutex> traj_lck(trajectory_mtx);
+      // 继续后的记录允许沿用既有轨迹；单独记录本次起始点数，分析时不再受旧数据干扰。
+      trajectory_debug_session_start_size = trajectory_history.size();
+    }
   } else {
 
     // If the file was open, then close it
