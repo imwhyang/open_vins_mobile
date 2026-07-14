@@ -105,13 +105,15 @@ class VioEngine {
      * @param gy 陀螺仪 Y 轴读数
      * @param gz 陀螺仪 Z 轴读数
      * @param timestampSec 时间戳（秒，boot time 参考系）
+     * @param pairDeltaSec 加速度计与陀螺仪原始时间戳差（秒）
      */
     fun processImu(
         ax: Float, ay: Float, az: Float,
         gx: Float, gy: Float, gz: Float,
-        timestampSec: Double
+        timestampSec: Double,
+        pairDeltaSec: Double = 0.0,
     ) {
-        processInertialJNI(ax, ay, az, gx, gy, gz, timestampSec)
+        processInertialJNI(ax, ay, az, gx, gy, gz, timestampSec, pairDeltaSec)
     }
 
     /**
@@ -188,7 +190,8 @@ class VioEngine {
     private external fun processInertialJNI(
         ax: Float, ay: Float, az: Float,
         gx: Float, gy: Float, gz: Float,
-        timestampSec: Double
+        timestampSec: Double,
+        pairDeltaSec: Double,
     )
     private external fun getCurrentPoseJNI(position: DoubleArray, quaternion: DoubleArray): Boolean
     private external fun getTrajectoryDataJNI(positions: DoubleArray, quaternions: DoubleArray): Int

@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import com.openvins.android.Camera2ResView
 import com.openvins.android.CameraFrameListener
+import com.openvins.android.ImuSampleSynchronizer
 import com.openvins.android.Trajectory3DView
 import com.openvins.android.VioEngine
 import com.openvins.android.component.TrajectoryRevisitor
@@ -131,10 +132,7 @@ class OpenVinsSdk(
 
     private var cameraView: Camera2ResView? = null
     private var trajectoryView: Trajectory3DView? = null
-    private var latestAccel: FloatArray? = null
-    private var latestGyro: FloatArray? = null
-    private var latestAccelTimestamp = 0L
-    private var latestGyroTimestamp = 0L
+    private val imuSampleSynchronizer = ImuSampleSynchronizer()
     private var running = false
     private var poseRecording = false
     private var activeSession: BarnInsuranceSession? = null
@@ -357,29 +355,19 @@ class OpenVinsSdk(
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
-        when (event?.sensor?.type) {
-            Sensor.TYPE_ACCELEROMETER -> {
-                latestAccel = event.values.copyOf()
-                latestAccelTimestamp = event.timestamp
-            }
-            Sensor.TYPE_GYROSCOPE -> {
-                latestGyro = event.values.copyOf()
-                latestGyroTimestamp = event.timestamp
-            }
-        }
+        event ?: return
+        val sample = when (event.sensor.type) {
+            Sensor.TYPE_ACCELEROMETER -> imuSampleSynchronizer.addAccelerometer(event.values, event.timestamp)
+            Sensor.TYPE_GYROSCOPE -> imuSampleSynchronizer.addGyroscope(event.values, event.timestamp)
+            else -> null
+        } ?: return
 
-        val accel = latestAccel ?: return
-        val gyro = latestGyro ?: return
-        val timestampSec = maxOf(latestAccelTimestamp, latestGyroTimestamp) * 1e-9
         engine.processImu(
-            accel[0], accel[1], accel[2],
-            gyro[0], gyro[1], gyro[2],
-            timestampSec,
+            sample.accel[0], sample.accel[1], sample.accel[2],
+            sample.gyro[0], sample.gyro[1], sample.gyro[2],
+            sample.timestampNs * 1e-9,
+            sample.pairDeltaNs * 1e-9,
         )
-        latestAccel = null
-        latestGyro = null
-        latestAccelTimestamp = 0L
-        latestGyroTimestamp = 0L
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
@@ -397,10 +385,7 @@ class OpenVinsSdk(
 
     private fun unregisterSensors() {
         sensorManager.unregisterListener(this)
-        latestAccel = null
-        latestGyro = null
-        latestAccelTimestamp = 0L
-        latestGyroTimestamp = 0L
+        imuSampleSynchronizer.reset()
     }
 
     private fun updateTrajectory() {

@@ -2,6 +2,7 @@ package com.openvins.app
 
 import com.openvins.android.Camera2ResView
 import com.openvins.android.CameraFrameListener
+import com.openvins.android.ImuSampleSynchronizer
 import com.openvins.android.Trajectory3DView
 import com.openvins.android.VioEngine
 
@@ -46,8 +47,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     private lateinit var sensorManager: SensorManager
     private var sensorAccel: Sensor? = null
     private var sensorGyro: Sensor? = null
-    private var eventAccel: SensorEvent? = null
-    private var eventGyro: SensorEvent? = null
+    private val imuSampleSynchronizer = ImuSampleSynchronizer()
 
     private val trajectoryRevisitor: TrajectoryRevisitor = TrajectoryRevisitor()
 
@@ -296,11 +296,13 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         super.onPause()
         if (mOpenCvCameraView != null) mOpenCvCameraView!!.disableView()
         sensorManager.unregisterListener(this)
+        imuSampleSynchronizer.reset()
         trajectoryUpdateHandler.removeCallbacks(trajectoryUpdateRunnable)
     }
 
     public override fun onResume() {
         super.onResume()
+        imuSampleSynchronizer.reset()
         // Activate camera feed
         mOpenCvCameraView!!.enableView()
 
@@ -358,36 +360,19 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
+        event ?: return
+        val sample = when (event.sensor.type) {
+            Sensor.TYPE_ACCELEROMETER -> imuSampleSynchronizer.addAccelerometer(event.values, event.timestamp)
+            Sensor.TYPE_GYROSCOPE -> imuSampleSynchronizer.addGyroscope(event.values, event.timestamp)
+            else -> null
+        } ?: return
 
-        // First check if we have any new events
-        when (event?.sensor?.type) {
-            Sensor.TYPE_ACCELEROMETER -> {
-                //Log.e(TAG, "[acc]: ${event.values[0]}, ${event.values[1]}, ${event.values[2]}")
-                eventAccel = event
-            }
-
-            Sensor.TYPE_GYROSCOPE -> {
-                //Log.e(TAG, "[gyro]: ${event.values[0]}, ${event.values[1]}, ${event.values[2]}")
-                eventGyro = event
-            }
-        }
-
-        // Next wait till we have both gyroscope and accelerometer
-        // TODO: we should try to be smarter about this selection as they could be
-        // TODO: out of sync and we should never know this...
-        if (eventAccel != null && eventGyro != null) {
-            // Use the sensor event timestamp (nanoseconds since boot, converted to seconds)
-            // This ensures consistent timing with camera timestamps which also use boot time reference
-            val timestampSec = (event!!.timestamp * 1e-9).toDouble()
-            vioEngine.processImu(
-                eventAccel!!.values[0], eventAccel!!.values[1], eventAccel!!.values[2],
-                eventGyro!!.values[0], eventGyro!!.values[1], eventGyro!!.values[2],
-                timestampSec
-            );
-            eventAccel = null;
-            eventGyro = null;
-        }
-
+        vioEngine.processImu(
+            sample.accel[0], sample.accel[1], sample.accel[2],
+            sample.gyro[0], sample.gyro[1], sample.gyro[2],
+            sample.timestampNs * 1e-9,
+            sample.pairDeltaNs * 1e-9,
+        )
     }
 
     override fun onAccuracyChanged(p0: Sensor?, p1: Int) {

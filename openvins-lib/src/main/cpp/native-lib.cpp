@@ -73,6 +73,7 @@ std::condition_variable processing_cv;
 double latest_imu_timestamp = 0.0;
 double last_accepted_imu_timestamp = 0.0;
 size_t accepted_imu_count = 0;
+std::atomic<double> latest_imu_pair_delta_seconds(0.0);
 std::mutex imu_timestamp_mtx;
 
 // Android IMU can occasionally emit large one-frame spikes. OpenVINS expects
@@ -688,7 +689,8 @@ void record_trajectory_debug(double timestamp, const Eigen::Vector3d &position, 
                          << "," << (anomaly ? 1 : 0) << "," << session_trajectory_size << "," << distance_to_trajectory_end
                          << "," << shifting_mileage << "," << (turning_in_place ? 1 : 0) << "," << (turn_protect_active ? 1 : 0)
                          << "," << (strong_turn_protect_active ? 1 : 0) << "," << (trajectory_resume_waiting_stable ? 1 : 0)
-                         << "," << trajectory_resume_stable_count << "," << trajectory_consistent_drift_count << std::endl;
+                         << "," << trajectory_resume_stable_count << "," << trajectory_consistent_drift_count << ","
+                         << latest_imu_pair_delta_seconds.load() << std::endl;
   }
 
   if (anomaly || !accepted) {
@@ -1116,7 +1118,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setRecordS
     trajectory_debug_csv << "timestamp,trajectory_size,p_x,p_y,p_z,q_x,q_y,q_z,q_w,dt,step_m,speed_mps,rot_rad,feature_count,zupt_active,"
                             "forward_projection,turn_guard_active,accepted,reject_reason,anomaly,session_trajectory_size,"
                             "distance_to_trajectory_end_m,shifting_mileage_m,turning_in_place,turn_protect_active,"
-                            "strong_turn_protect_active,resume_waiting_stable,resume_stable_count,consistent_drift_count"
+                            "strong_turn_protect_active,resume_waiting_stable,resume_stable_count,consistent_drift_count,imu_pair_delta_s"
                          << std::endl;
     reset_trajectory_debug_state();
     {
@@ -1646,11 +1648,13 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIma
 
 extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processInertialJNI(JNIEnv *env, jobject instance, jfloat ax,
                                                                                          jfloat ay, jfloat az, jfloat gx, jfloat gy,
-                                                                                         jfloat gz, jdouble timestampSec) {
+                                                                                         jfloat gz, jdouble timestampSec,
+                                                                                         jdouble pairDeltaSec) {
 
   // Use the hardware timestamp from SensorEvent (nanoseconds since boot, converted to seconds)
   // This ensures consistent timing and matches camera timestamp reference
   double time_in_sec = timestampSec;
+  latest_imu_pair_delta_seconds.store(std::max(0.0, static_cast<double>(pairDeltaSec)));
   unsigned long long time_in_ns = (unsigned long long)(time_in_sec * 1e9);
 
   // Cast to our native type
