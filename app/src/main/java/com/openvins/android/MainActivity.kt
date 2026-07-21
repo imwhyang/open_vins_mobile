@@ -552,6 +552,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
             7 -> "转身后出现反向位移"
             8 -> "转身后速度异常"
             9 -> "转身后特征点偏少且跳动较大"
+            11 -> "摄像头不可用期间检测到手机移动，无法可靠恢复这段距离"
             else -> "轨迹点连续异常"
         }
     }
