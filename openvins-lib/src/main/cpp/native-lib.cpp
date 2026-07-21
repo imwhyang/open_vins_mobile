@@ -135,6 +135,11 @@ const double CAMERA_BLOCKED_MEAN_MAX = 10.0;
 const double CAMERA_BLOCKED_STDDEV_MAX = 10.0;
 const double CAMERA_BLOCKED_DARK_RATIO_MIN = 0.95;
 const int CAMERA_DARK_PIXEL_THRESHOLD = 18;
+// 实测手掌遮挡不一定是全黑，但拉普拉斯分数会长期接近 0。
+// 快速晃动则只有在角速度较大且清晰度明显下降时才过滤，避免影响正常转弯。
+const double CAMERA_UNUSABLE_BLUR_MAX = 20.0;
+const double CAMERA_MOTION_BLUR_MAX = 150.0;
+const double CAMERA_MOTION_BLUR_GYRO_MIN = 2.0;
 const size_t VISUAL_INTERRUPTION_CONFIRM_FRAMES = 3;
 const size_t VISUAL_INTERRUPTION_MOTION_CONFIRM_FRAMES = 5;
 const double VISUAL_INTERRUPTION_MOTION_GRACE_SECONDS = 0.7;
@@ -143,18 +148,27 @@ const double VISUAL_INTERRUPTION_MOTION_GRACE_SECONDS = 0.7;
 // 在恢复第一帧一次性产生几十米跳变。
 std::mutex visual_interruption_mtx;
 size_t visual_blocked_consecutive_frames = 0;
+size_t visual_clear_consecutive_frames = 0;
 size_t visual_motion_consecutive_frames = 0;
 bool visual_interruption_active = false;
 bool visual_interruption_had_motion = false;
 double visual_interruption_start_timestamp = -1.0;
+// 0=正常，1=当前画面质量过低，图像帧未参与定位。
+std::atomic<int> visual_recovery_user_state(0);
+// 漂移后继续流程单独维护状态，避免摄像头遮挡状态将初始化提示覆盖。
+// 0=正常，2=VIO 已初始化并正在等待轨迹稳定，3=正在重新初始化 VIO。
+std::atomic<int> trajectory_recovery_user_state(0);
 
 void reset_visual_interruption_state() {
   std::lock_guard<std::mutex> lck(visual_interruption_mtx);
   visual_blocked_consecutive_frames = 0;
+  visual_clear_consecutive_frames = 0;
   visual_motion_consecutive_frames = 0;
   visual_interruption_active = false;
   visual_interruption_had_motion = false;
   visual_interruption_start_timestamp = -1.0;
+  visual_recovery_user_state.store(0);
+  trajectory_recovery_user_state.store(0);
 }
 
 void update_imu_motion_state(double timestamp, double accel_norm, double gyro_norm) {
@@ -211,6 +225,7 @@ struct CameraQuality {
   double stddev = 0.0;
   double dark_ratio = 0.0;
   double blur_score = 0.0;
+  bool unusable_texture = false;
   bool blocked = false;
 };
 
@@ -232,8 +247,10 @@ CameraQuality evaluate_camera_quality(const cv::Mat &gray) {
   cv::Scalar laplacian_stddev;
   cv::meanStdDev(laplacian, laplacian_mean, laplacian_stddev);
   quality.blur_score = laplacian_stddev[0] * laplacian_stddev[0];
+  quality.unusable_texture = quality.blur_score <= CAMERA_UNUSABLE_BLUR_MAX;
   quality.blocked = quality.dark_ratio >= CAMERA_BLOCKED_DARK_RATIO_MIN ||
-                    (quality.mean <= CAMERA_BLOCKED_MEAN_MAX && quality.stddev <= CAMERA_BLOCKED_STDDEV_MAX);
+                    (quality.mean <= CAMERA_BLOCKED_MEAN_MAX && quality.stddev <= CAMERA_BLOCKED_STDDEV_MAX) ||
+                    quality.unusable_texture;
   return quality;
 }
 
@@ -1065,6 +1082,13 @@ void processing_worker_thread() {
         // Store trajectory point (camera pose)
         // q_cam is JPL format [qx, qy, qz, qw], but TrajectoryPoint expects [qw, qx, qy, qz]
         std::lock_guard<std::mutex> traj_lck(trajectory_mtx);
+        if (trajectory_resume_waiting_stable && trajectory_recovery_user_state.load() == 3) {
+          // 初始化完成后还需要等待新坐标系与最后可靠轨迹点完成对齐。
+          trajectory_recovery_user_state.store(2);
+        }
+        if (trajectory_recovery_user_state.load() == 3 && trajectory_history.empty()) {
+          trajectory_recovery_user_state.store(0);
+        }
         Eigen::Vector3d p_traj = p_cam;
         Eigen::Vector3d p_raw_for_alignment = p_cam;
         Eigen::Vector4d q_raw_for_alignment = q_cam;
@@ -1128,6 +1152,7 @@ void processing_worker_thread() {
               trajectory_shift_window.clear();
               reset_consistent_drift_detector();
               accept_trajectory_point = true;
+              trajectory_recovery_user_state.store(0);
             }
           } else if (turn_protected && !is_too_far_from_trajectory_end(p_traj)) {
             // 转弯保护期内允许正常移动轨迹通过，但不累计 shifting 窗口，
@@ -1292,7 +1317,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setRecordS
     camera_quality_debug_csv
         << "timestamp,image_mean,image_stddev,dark_pixel_ratio,blur_score,blocked,imu_accel_norm,imu_gyro_norm,"
            "imu_accel_stddev,imu_gyro_mean,imu_static,frame_delta_s,camera_queue_size,imu_pair_delta_s,"
-           "visual_interruption_active,recovery_detected,interruption_had_motion"
+           "visual_interruption_active,recovery_detected,interruption_had_motion,vio_time_offset_s,"
+           "unusable_texture,motion_blurred,frame_filtered"
         << std::endl;
     reset_trajectory_debug_state();
     {
@@ -1592,7 +1618,17 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_getDispla
     return reinterpret_cast<jlong>(rgbMat);
   }
 
-  // System is running - get visualization image with overlays
+  if (visual_recovery_user_state.load() != 0 && rawCameraMatAddr != 0) {
+    // 视觉中断期间显示真实实时画面，状态原因由界面文字说明；
+    // 不显示冻结的旧关键点，避免用户误以为遮挡画面仍在参与定位。
+    cv::Mat &rawMat = *(cv::Mat *)rawCameraMatAddr;
+    cv::Mat *rgbMat = new cv::Mat();
+    cv::cvtColor(rawMat, *rgbMat, cv::COLOR_RGBA2GRAY);
+    return reinterpret_cast<jlong>(rgbMat);
+  }
+
+  // 系统运行时保留 OpenVINS 原生可视化。漂移后重新初始化期间，用户可以直接看到
+  // INIT、特征点和初始化参数变化，比只显示一行文字更容易理解当前进度。
   cv::Mat viz_img = local_sys->get_historical_viz_image();
   if (viz_img.empty()) {
     // Fallback to raw camera if no viz image
@@ -1654,7 +1690,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIma
 
   // Use the hardware timestamp from Camera2 (nanoseconds since boot, converted to seconds)
   // This ensures consistent frame-to-frame timing and matches IMU timestamp reference
-  double time_in_sec = timestampSec;
+  const double raw_time_in_sec = timestampSec;
+  const double time_in_sec = raw_time_in_sec;
   unsigned long long time_in_ns = (unsigned long long)(time_in_sec * 1e9);
 
   // get Mat from raw address
@@ -1779,19 +1816,24 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIma
     }
 
     bool interruption_active_for_log = false;
-    bool recovery_detected = false;
     bool interruption_had_motion = false;
+    const bool motion_blurred = camera_quality.blur_score <= CAMERA_MOTION_BLUR_MAX &&
+                                latest_imu_gyro_norm.load() >= CAMERA_MOTION_BLUR_GYRO_MIN;
+    const bool frame_filtered = camera_quality.blocked || motion_blurred;
     {
       std::lock_guard<std::mutex> state_lck(visual_interruption_mtx);
       if (camera_quality.blocked) {
         visual_blocked_consecutive_frames++;
+        visual_clear_consecutive_frames = 0;
         if (!visual_interruption_active && visual_blocked_consecutive_frames >= VISUAL_INTERRUPTION_CONFIRM_FRAMES) {
           visual_interruption_active = true;
-          visual_interruption_start_timestamp = time_in_sec;
+          visual_interruption_start_timestamp = raw_time_in_sec;
           visual_motion_consecutive_frames = 0;
           visual_interruption_had_motion = false;
+          visual_recovery_user_state.store(1);
         }
-        if (visual_interruption_active && time_in_sec - visual_interruption_start_timestamp >= VISUAL_INTERRUPTION_MOTION_GRACE_SECONDS) {
+        if (visual_interruption_active &&
+            raw_time_in_sec - visual_interruption_start_timestamp >= VISUAL_INTERRUPTION_MOTION_GRACE_SECONDS) {
           if (latest_imu_static.load()) {
             visual_motion_consecutive_frames = 0;
           } else {
@@ -1803,64 +1845,46 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIma
         }
       } else {
         if (visual_interruption_active) {
-          recovery_detected = true;
+          // 只过滤明确异常的图像帧。首个正常帧到达后立即解除遮挡状态，
+          // 不冻结 IMU、不压缩时间轴，也不重建 VIO，避免恢复流程卡住。
           interruption_had_motion = visual_interruption_had_motion;
+          visual_blocked_consecutive_frames = 0;
+          visual_clear_consecutive_frames = 0;
+          visual_motion_consecutive_frames = 0;
+          visual_interruption_active = false;
+          visual_interruption_had_motion = false;
+          visual_interruption_start_timestamp = -1.0;
+          visual_recovery_user_state.store(0);
+        } else {
+          visual_blocked_consecutive_frames = 0;
+          visual_clear_consecutive_frames = 0;
+          visual_motion_consecutive_frames = 0;
         }
-        visual_blocked_consecutive_frames = 0;
-        visual_motion_consecutive_frames = 0;
-        visual_interruption_active = false;
-        visual_interruption_had_motion = false;
-        visual_interruption_start_timestamp = -1.0;
       }
       interruption_active_for_log = visual_interruption_active;
     }
 
     if (is_recording && camera_quality_debug_csv.is_open()) {
       std::lock_guard<std::mutex> log_lck(camera_quality_debug_csv_mtx);
-      camera_quality_debug_csv << std::fixed << std::setprecision(9) << time_in_sec << "," << camera_quality.mean << ","
+      camera_quality_debug_csv << std::fixed << std::setprecision(9) << raw_time_in_sec << "," << camera_quality.mean << ","
                                << camera_quality.stddev << "," << camera_quality.dark_ratio << "," << camera_quality.blur_score << ","
                                << (camera_quality.blocked ? 1 : 0) << "," << latest_imu_accel_norm.load() << ","
                                << latest_imu_gyro_norm.load() << "," << latest_imu_accel_stddev.load() << ","
                                << latest_imu_gyro_mean.load() << "," << (latest_imu_static.load() ? 1 : 0) << "," << frame_delta << ","
                                << camera_queue_size << "," << latest_imu_pair_delta_seconds.load() << ","
-                               << (interruption_active_for_log ? 1 : 0) << "," << (recovery_detected ? 1 : 0) << ","
-                               << (interruption_had_motion ? 1 : 0) << std::endl;
+                               << (interruption_active_for_log ? 1 : 0) << "," << 0 << ","
+                               << (interruption_had_motion ? 1 : 0) << "," << 0.0 << ","
+                               << (camera_quality.unusable_texture ? 1 : 0) << "," << (motion_blurred ? 1 : 0) << ","
+                               << (frame_filtered ? 1 : 0) << std::endl;
     }
 
-    if (recovery_detected) {
-      // 视觉恢复时必须舍弃中断期间仅靠 IMU 积分的旧状态。下一帧会创建新的 VIO，
-      // 初始化完成后通过已有刚体对齐逻辑接回最后可靠轨迹点。
-      prepare_trajectory_for_visual_recovery(interruption_had_motion);
-      {
-        std::lock_guard<std::mutex> sys_lck(sys_mtx);
-        sys = nullptr;
-      }
-      {
-        std::lock_guard<std::mutex> queue_lck(camera_queue_mtx);
-        camera_queue.clear();
-        camera_last_timestamp.clear();
-      }
-      {
-        std::lock_guard<std::mutex> imu_lck(imu_timestamp_mtx);
-        latest_imu_timestamp = 0.0;
-        last_accepted_imu_timestamp = 0.0;
-        accepted_imu_count = 0;
-      }
-      viz_time = -1.0;
-      viz_track_rate = 0.0;
-      viz_track_last_time = -1.0;
-      __android_log_print(ANDROID_LOG_INFO, TAG, "Visual recovery detected, rebuilding VIO (moved=%d)\n",
-                          interruption_had_motion ? 1 : 0);
-      return;
-    }
-
-    if (camera_quality.blocked) {
-      // 明确遮挡的画面不能提供可靠视觉约束。继续送入 OpenVINS 会让黑暗噪点或残留特征
-      // 污染速度和位置，因此直接丢弃该帧；IMU仍正常接收，画面恢复后再继续视觉更新。
+    if (frame_filtered) {
+      // 遮挡、低纹理或高速旋转下的严重模糊帧不能提供可靠视觉约束。
+      // 这里只过滤当前图像帧，IMU 与相机预览保持连续，也不会触发重新初始化。
       __android_log_print(ANDROID_LOG_WARN, TAG,
-                          "Dropping blocked camera frame: mean=%.2f std=%.2f dark=%.3f blur=%.2f imu_static=%d\n",
+                          "Dropping low-quality camera frame: mean=%.2f std=%.2f dark=%.3f blur=%.2f gyro=%.3f blocked=%d motion_blur=%d\n",
                           camera_quality.mean, camera_quality.stddev, camera_quality.dark_ratio, camera_quality.blur_score,
-                          latest_imu_static.load() ? 1 : 0);
+                          latest_imu_gyro_norm.load(), camera_quality.blocked ? 1 : 0, motion_blurred ? 1 : 0);
       return;
     }
 
@@ -2002,6 +2026,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIne
     return;
   }
 
+  const double vio_time_in_sec = time_in_sec;
+
   // If recording save to disk
   if (is_recording && imu_csv.is_open()) {
     imu_csv << time_in_ns << "," << n_gx << "," << n_gy << "," << n_gz << "," << n_ax << "," << n_ay << "," << n_az << std::endl;
@@ -2016,13 +2042,13 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIne
 
   if (is_running_ov) {
     std::lock_guard<std::mutex> imu_lck(imu_timestamp_mtx);
-    if (time_in_sec <= last_accepted_imu_timestamp) {
-      __android_log_print(ANDROID_LOG_WARN, TAG, "Skipping non-monotonic IMU timestamp: %.9f <= %.9f\n", time_in_sec,
+    if (vio_time_in_sec <= last_accepted_imu_timestamp) {
+      __android_log_print(ANDROID_LOG_WARN, TAG, "Skipping non-monotonic IMU timestamp: %.9f <= %.9f\n", vio_time_in_sec,
                           last_accepted_imu_timestamp);
       return;
     }
-    last_accepted_imu_timestamp = time_in_sec;
-    latest_imu_timestamp = time_in_sec;
+    last_accepted_imu_timestamp = vio_time_in_sec;
+    latest_imu_timestamp = vio_time_in_sec;
     accepted_imu_count++;
   }
 
@@ -2030,7 +2056,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIne
   if (local_sys != nullptr) {
     // Send it into the system
     ov_core::ImuData message_imu;
-    message_imu.timestamp = time_in_sec;
+    message_imu.timestamp = vio_time_in_sec;
     message_imu.wm << n_gx, n_gy, n_gz;
     message_imu.am << n_ax, n_ay, n_az;
     try {
@@ -2159,6 +2185,12 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_openvins_android_VioEngine_isTraj
   return trajectory_data_paused ? JNI_TRUE : JNI_FALSE;
 }
 
+extern "C" JNIEXPORT jint JNICALL Java_com_openvins_android_VioEngine_getVisualRecoveryStateJNI(JNIEnv *env, jobject instance) {
+  // 漂移恢复提示优先级高于遮挡提示，两个状态不再互相清除。
+  const int trajectory_state = trajectory_recovery_user_state.load();
+  return static_cast<jint>(trajectory_state != 0 ? trajectory_state : visual_recovery_user_state.load());
+}
+
 extern "C" JNIEXPORT jint JNICALL Java_com_openvins_android_VioEngine_getTrajectoryPauseReasonJNI(JNIEnv *env, jobject instance) {
   std::lock_guard<std::mutex> lck(trajectory_mtx);
   return trajectory_pause_reason;
@@ -2214,6 +2246,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_resumeTraj
     // 重新创建 VIO，避免已经异常的估计状态在继续后沿着原来的方向继续漂。
     sys = nullptr;
   }
+  trajectory_recovery_user_state.store(3);
   {
     std::lock_guard<std::mutex> lck(camera_queue_mtx);
     camera_queue.clear();

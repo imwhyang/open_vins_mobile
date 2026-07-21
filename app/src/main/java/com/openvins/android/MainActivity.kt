@@ -382,6 +382,17 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
     private fun updateTrajectoryView() {
         if (trajectoryView == null) return
 
+        val visualRecoveryState = vioEngine.getVisualRecoveryState()
+        if (visualRecoveryState != 0) {
+            tvPose?.text = when (visualRecoveryState) {
+                1 -> "摄像头画面不可用，当前帧已过滤"
+                2 -> "初始化已完成，正在对齐上次轨迹，请继续正常移动"
+                3 -> "INIT 初始化中：保持画面清晰，缓慢移动手机以完成定位"
+                else -> ""
+            }
+            tvPose?.setTextColor(ContextCompat.getColor(this, android.R.color.holo_orange_light))
+        }
+
         if (vioEngine.isTrajectoryPaused()) {
             updateTrajectoryViewWithLastReliablePose()
             showTrajectoryPausedDialogIfNeeded(vioEngine.getTrajectoryPauseReason())
@@ -444,19 +455,21 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         val currQuatFloats = FloatArray(4) { currentQuat[it].toFloat() }
 
 //        当前数据是否飘移
-        val shifting = trajectoryRevisitor.shiftingTrajectory(
-            currentPos, currentQuat
-        )
-        if (shifting) {
-            tvPose?.text = String.format("shifting")
-            val params = RelativeLayout.LayoutParams(
-                RelativeLayout.LayoutParams.WRAP_CONTENT,
-                RelativeLayout.LayoutParams.WRAP_CONTENT
+        if (visualRecoveryState == 0) {
+            val shifting = trajectoryRevisitor.shiftingTrajectory(
+                currentPos, currentQuat
             )
-            params.setMargins(200, 400, 0, 0)
-            tvPose?.layoutParams = params
-        } else {
-            tvPose?.text = ""
+            if (shifting) {
+                tvPose?.text = String.format("shifting")
+                val params = RelativeLayout.LayoutParams(
+                    RelativeLayout.LayoutParams.WRAP_CONTENT,
+                    RelativeLayout.LayoutParams.WRAP_CONTENT
+                )
+                params.setMargins(200, 400, 0, 0)
+                tvPose?.layoutParams = params
+            } else {
+                tvPose?.text = ""
+            }
         }
 
         // 判断路径重访状态

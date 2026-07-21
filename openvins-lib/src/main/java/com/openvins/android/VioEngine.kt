@@ -141,6 +141,11 @@ class VioEngine {
         return isTrajectoryPausedJNI()
     }
 
+    /** 获取定位恢复状态：0正常、1遮挡帧过滤、2轨迹对齐、3后台初始化。 */
+    fun getVisualRecoveryState(): Int {
+        return getVisualRecoveryStateJNI()
+    }
+
     fun getTrajectoryPauseReason(): Int {
         return getTrajectoryPauseReasonJNI()
     }
@@ -196,6 +201,7 @@ class VioEngine {
     private external fun getCurrentPoseJNI(position: DoubleArray, quaternion: DoubleArray): Boolean
     private external fun getTrajectoryDataJNI(positions: DoubleArray, quaternions: DoubleArray): Int
     private external fun isTrajectoryPausedJNI(): Boolean
+    private external fun getVisualRecoveryStateJNI(): Int
     private external fun getTrajectoryPauseReasonJNI(): Int
     private external fun resumeTrajectoryJNI()
     private external fun processYUVToRGBAJNI(
