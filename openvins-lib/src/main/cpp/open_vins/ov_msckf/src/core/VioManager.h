@@ -149,6 +149,9 @@ public:
     return count;
   }
 
+  /// 返回最近一次 MSCKF 更新实际采用的特征数量，用于判断跟踪点中有多少通过了几何校验。
+  size_t get_last_update_feature_count() { return good_features_MSCKF.size(); }
+
   /// Returns if the latest camera update used a zero-velocity update.
   bool last_update_used_zupt() { return did_zupt_update; }
 

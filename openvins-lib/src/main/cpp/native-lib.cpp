@@ -122,6 +122,9 @@ const double IMU_STATIC_GYRO_MEAN_MAX = 0.08;
 // a nice feature to have for general robustness to bad camera drivers.
 std::deque<ov_core::CameraData> camera_queue;
 std::mutex camera_queue_mtx;
+std::atomic<double> latest_camera_processing_age_seconds(0.0);
+std::atomic<double> latest_camera_imu_lead_seconds(0.0);
+std::atomic<size_t> latest_camera_queue_after_pop(0);
 
 // Last camera message timestamps we have received (mapped by cam id)
 std::map<int, double> camera_last_timestamp;
@@ -281,14 +284,21 @@ const size_t MAX_TRAJECTORY_POINTS = 10000; // Limit trajectory size
 const double TRAJECTORY_DEBUG_JUMP_METERS = 0.25;
 const double TRAJECTORY_DEBUG_SPEED_MPS = 1.5;
 const double TRAJECTORY_DEBUG_ROTATION_RAD = 0.52; // 30 deg
-const size_t TRAJECTORY_GATE_MIN_FEATURES = 20;
-const size_t TRAJECTORY_GATE_LOW_FEATURES = 50;
-const size_t TRAJECTORY_GATE_ROTATION_FEATURES = 60;
-const double TRAJECTORY_GATE_MAX_STEP_METERS = 0.80;
-const double TRAJECTORY_GATE_MAX_SPEED_MPS = 1.5;
-const double TRAJECTORY_GATE_LOW_FEATURE_STEP_METERS = 0.35;
-const double TRAJECTORY_GATE_ROTATION_STEP_METERS = 0.15;
+const size_t TRAJECTORY_GATE_MIN_FEATURES = 15;
+const size_t TRAJECTORY_GATE_LOW_FEATURES = 40;
+const size_t TRAJECTORY_GATE_ROTATION_FEATURES = 40;
+const double TRAJECTORY_GATE_MAX_STEP_METERS = 0.30;
+// 当前正常步行与转弯样本最大瞬时速度约 3.9m/s，5m/s 仍保留设备抖动余量，
+// 同时可以拦截本次日志中 6.9~7.7m/s 的残留漂移点。
+const double TRAJECTORY_GATE_MAX_SPEED_MPS = 5.0;
+const double TRAJECTORY_GATE_LOW_FEATURE_STEP_METERS = 0.15;
+const double TRAJECTORY_GATE_ROTATION_STEP_METERS = 0.18;
 const double TRAJECTORY_GATE_ROTATION_RAD = 0.52; // 30 deg
+// 业务操作中手机朝向与行走方向基本一致。负值表示估计位移明显落在摄像头后方；
+// 阈值保留转弯和轻微侧移余量，不要求轨迹必须严格沿光轴。
+const double TRAJECTORY_GATE_BACKWARD_PROJECTION = -0.35;
+const double TRAJECTORY_GATE_BACKWARD_MIN_STEP_METERS = 0.03;
+const double TRAJECTORY_GATE_TURN_BACKWARD_MIN_STEP_METERS = 0.08;
 const double TRAJECTORY_TURN_GUARD_ROT_RAD = 0.08;
 const double TRAJECTORY_TURN_GUARD_MAX_STEP_METERS = 0.08;
 const double TRAJECTORY_TURN_GUARD_SECONDS = 1.00;
@@ -463,16 +473,12 @@ bool should_accept_trajectory_point(double timestamp, const Eigen::Vector3d &pos
     reject_reason = TRAJECTORY_REJECT_ROTATION_LOW_FEATURE_JUMP;
     return false;
   }
-  if (turn_guard_active && step > TRAJECTORY_TURN_GUARD_MIN_STEP_METERS && forward_projection < TRAJECTORY_TURN_GUARD_BACKWARD_PROJECTION) {
+  const double backward_min_step =
+      turn_guard_active ? TRAJECTORY_GATE_TURN_BACKWARD_MIN_STEP_METERS : TRAJECTORY_GATE_BACKWARD_MIN_STEP_METERS;
+  if (step > backward_min_step && forward_projection < TRAJECTORY_GATE_BACKWARD_PROJECTION) {
+    // 正常完成 180 度转身后，位置增量和新的相机前向仍应同向。
+    // 这里只拦截方向明显相反且已有实际位移的点，原地转身抖动不会进入该条件。
     reject_reason = TRAJECTORY_REJECT_BACKWARD_AFTER_TURN;
-    return false;
-  }
-  if (turn_guard_active && step > TRAJECTORY_TURN_GUARD_FAST_STEP_METERS && speed > TRAJECTORY_TURN_GUARD_FAST_SPEED_MPS) {
-    reject_reason = TRAJECTORY_REJECT_FAST_AFTER_TURN;
-    return false;
-  }
-  if (turn_guard_active && step > TRAJECTORY_TURN_GUARD_LOW_FEATURE_STEP_METERS && feature_count < TRAJECTORY_TURN_GUARD_LOW_FEATURES) {
-    reject_reason = TRAJECTORY_REJECT_LOW_FEATURE_TURN_JUMP;
     return false;
   }
 
@@ -836,7 +842,7 @@ void reset_trajectory_debug_state() {
 }
 
 void record_trajectory_debug(double timestamp, const Eigen::Vector3d &position, const Eigen::Vector4d &quaternion, size_t trajectory_size,
-                             size_t feature_count, bool zupt_active, bool accepted, int reject_reason) {
+                             size_t feature_count, size_t update_feature_count, bool zupt_active, bool accepted, int reject_reason) {
   double qw = quaternion(3);
   double qx = quaternion(0);
   double qy = quaternion(1);
@@ -859,6 +865,7 @@ void record_trajectory_debug(double timestamp, const Eigen::Vector3d &position, 
   size_t session_trajectory_size = trajectory_size >= trajectory_debug_session_start_size
                                        ? trajectory_size - trajectory_debug_session_start_size
                                        : 0;
+  const double feature_use_ratio = feature_count > 0 ? static_cast<double>(update_feature_count) / static_cast<double>(feature_count) : 0.0;
 
   if (compute_trajectory_delta(timestamp, position, quaternion, dt, step, speed, rot, forward_projection)) {
     anomaly = dt <= 0.0 || step > TRAJECTORY_DEBUG_JUMP_METERS || speed > TRAJECTORY_DEBUG_SPEED_MPS ||
@@ -874,15 +881,15 @@ void record_trajectory_debug(double timestamp, const Eigen::Vector3d &position, 
                          << "," << shifting_mileage << "," << (turning_in_place ? 1 : 0) << "," << (turn_protect_active ? 1 : 0)
                          << "," << (strong_turn_protect_active ? 1 : 0) << "," << (trajectory_resume_waiting_stable ? 1 : 0)
                          << "," << trajectory_resume_stable_count << "," << trajectory_consistent_drift_count << ","
-                         << latest_imu_pair_delta_seconds.load() << std::endl;
+                         << latest_imu_pair_delta_seconds.load() << "," << update_feature_count << "," << feature_use_ratio << std::endl;
   }
 
   if (anomaly || !accepted) {
     __android_log_print(ANDROID_LOG_WARN, TAG,
                         "Trajectory point: t=%.6f dt=%.4f step=%.3f speed=%.3f rot_deg=%.1f forward=%.2f guard=%d features=%zu zupt=%d "
-                        "accepted=%d reason=%d size=%zu\n",
+                        "accepted=%d reason=%d size=%zu update_features=%zu use_ratio=%.3f\n",
                         timestamp, dt, step, speed, rot * 180.0 / M_PI, forward_projection, turn_guard_active ? 1 : 0, feature_count,
-                        zupt_active ? 1 : 0, accepted ? 1 : 0, reject_reason, trajectory_size);
+                        zupt_active ? 1 : 0, accepted ? 1 : 0, reject_reason, trajectory_size, update_feature_count, feature_use_ratio);
   }
 
   trajectory_debug_last_timestamp = timestamp;
@@ -940,7 +947,9 @@ void processing_worker_thread() {
 
       // Wait for either new data or shutdown signal
       // Timeout after 100ms to periodically check if we should exit
-      processing_cv.wait_for(proc_lck, std::chrono::milliseconds(100), [&] { return !thread_should_run; });
+      // 不使用只检查退出状态的 predicate。旧写法会忽略相机入队时的 notify，
+      // 导致线程经常等满 100ms 后才批量处理，不同帧率手机会产生不同队列延迟。
+      processing_cv.wait_for(proc_lck, std::chrono::milliseconds(100));
     } // Release lock before processing
 
     if (!thread_should_run) {
@@ -1028,6 +1037,10 @@ void processing_worker_thread() {
       if (!has_message) {
         break;
       }
+
+      latest_camera_processing_age_seconds.store(std::max(0.0, time_now_sec - cam_msg.timestamp));
+      latest_camera_imu_lead_seconds.store(std::max(0.0, timestamp_imu_inC - cam_msg.timestamp));
+      latest_camera_queue_after_pop.store(queue_size_after_pop);
 
       // Process this camera measurement (lock is released during this call)
       auto t_feed_start = boost::posix_time::microsec_clock::local_time();
@@ -1128,12 +1141,21 @@ void processing_worker_thread() {
           apply_trajectory_alignment(p_traj, q_cam);
         }
         size_t feature_count = local_sys->get_last_track_count();
+        size_t update_feature_count = local_sys->get_last_update_feature_count();
         bool zupt_active = local_sys->last_update_used_zupt();
         int reject_reason = TRAJECTORY_REJECT_NONE;
         bool accept_trajectory_point = false;
         if (!trajectory_data_paused) {
           bool turn_protected = update_turn_protection(state->_timestamp, p_traj, q_cam);
-          if (is_turning_in_place(p_traj, q_cam)) {
+          // 先执行基础健康门控。此前该函数虽然存在但没有接入轨迹写入流程，
+          // 导致几十米每秒的明显错误点仍可能被转弯保护分支接受。
+          // 这类单点异常只静默过滤，不累计弹窗次数。
+          const bool point_health_ok =
+              should_accept_trajectory_point(state->_timestamp, p_traj, q_cam, feature_count, reject_reason);
+          if (!point_health_ok) {
+            trajectory_shift_window.clear();
+            reset_consistent_drift_detector();
+          } else if (is_turning_in_place(p_traj, q_cam)) {
             // 严格原地转身只更新方向锚点，不追加轨迹点。
             // 普通转弯不能走这里，否则边走边转时会出现“方向框动、轨迹不画”。
             Eigen::Vector3d last_position;
@@ -1213,7 +1235,7 @@ void processing_worker_thread() {
           accept_trajectory_point = false;
           reject_reason = trajectory_pause_reason;
         }
-        record_trajectory_debug(state->_timestamp, p_traj, q_cam, trajectory_history.size(), feature_count, zupt_active,
+        record_trajectory_debug(state->_timestamp, p_traj, q_cam, trajectory_history.size(), feature_count, update_feature_count, zupt_active,
                                 accept_trajectory_point, reject_reason);
 
         // Display the current state
@@ -1311,6 +1333,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setRecordS
                             "forward_projection,turn_guard_active,accepted,reject_reason,anomaly,session_trajectory_size,"
                             "distance_to_trajectory_end_m,shifting_mileage_m,turning_in_place,turn_protect_active,"
                             "strong_turn_protect_active,resume_waiting_stable,resume_stable_count,consistent_drift_count,imu_pair_delta_s"
+                            ",update_feature_count,feature_use_ratio"
                          << std::endl;
     std::string camera_quality_csv_name = s + "camera_quality_debug.csv";
     camera_quality_debug_csv.open(save_folder + camera_quality_csv_name);
@@ -1318,7 +1341,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setRecordS
         << "timestamp,image_mean,image_stddev,dark_pixel_ratio,blur_score,blocked,imu_accel_norm,imu_gyro_norm,"
            "imu_accel_stddev,imu_gyro_mean,imu_static,frame_delta_s,camera_queue_size,imu_pair_delta_s,"
            "visual_interruption_active,recovery_detected,interruption_had_motion,vio_time_offset_s,"
-           "unusable_texture,motion_blurred,frame_filtered"
+           "unusable_texture,motion_blurred,frame_filtered,camera_processing_age_s,camera_imu_lead_s,"
+           "camera_queue_after_pop"
         << std::endl;
     reset_trajectory_debug_state();
     {
@@ -1875,7 +1899,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIma
                                << (interruption_active_for_log ? 1 : 0) << "," << 0 << ","
                                << (interruption_had_motion ? 1 : 0) << "," << 0.0 << ","
                                << (camera_quality.unusable_texture ? 1 : 0) << "," << (motion_blurred ? 1 : 0) << ","
-                               << (frame_filtered ? 1 : 0) << std::endl;
+                               << (frame_filtered ? 1 : 0) << "," << latest_camera_processing_age_seconds.load() << ","
+                               << latest_camera_imu_lead_seconds.load() << "," << latest_camera_queue_after_pop.load() << std::endl;
     }
 
     if (frame_filtered) {
@@ -2067,6 +2092,10 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIne
       __android_log_print(ANDROID_LOG_ERROR, TAG, "feed_measurement_imu unknown exception\n");
     }
   }
+
+  // 相机帧可能因时间戳略新于最新 IMU 而暂存在队列中。旧逻辑只能等下一帧相机
+  // 或 100ms 超时后重试；每条有效 IMU 到达时唤醒一次，可在 IMU 追上后立即处理。
+  processing_cv.notify_one();
 }
 
 // JNI functions for trajectory visualization

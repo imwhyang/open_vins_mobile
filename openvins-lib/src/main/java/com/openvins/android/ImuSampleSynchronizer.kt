@@ -28,10 +28,13 @@ class ImuSampleSynchronizer(
     private var lastAccelTimestampNs = Long.MIN_VALUE
     private var lastGyroTimestampNs = Long.MIN_VALUE
     private var lastOutputTimestampNs = Long.MIN_VALUE
+    private var estimatedAccelPeriodNs = 0.0
+    private var estimatedGyroPeriodNs = 0.0
 
     @Synchronized
     fun addAccelerometer(values: FloatArray, timestampNs: Long): Sample? {
         if (timestampNs <= lastAccelTimestampNs || values.size < 3) return null
+        estimatedAccelPeriodNs = updateEstimatedPeriod(estimatedAccelPeriodNs, lastAccelTimestampNs, timestampNs)
         lastAccelTimestampNs = timestampNs
         pendingAccel = SensorSample(values.copyOf(3), timestampNs)
         return tryCreateSample()
@@ -40,6 +43,7 @@ class ImuSampleSynchronizer(
     @Synchronized
     fun addGyroscope(values: FloatArray, timestampNs: Long): Sample? {
         if (timestampNs <= lastGyroTimestampNs || values.size < 3) return null
+        estimatedGyroPeriodNs = updateEstimatedPeriod(estimatedGyroPeriodNs, lastGyroTimestampNs, timestampNs)
         lastGyroTimestampNs = timestampNs
         pendingGyro = SensorSample(values.copyOf(3), timestampNs)
         return tryCreateSample()
@@ -52,6 +56,8 @@ class ImuSampleSynchronizer(
         lastAccelTimestampNs = Long.MIN_VALUE
         lastGyroTimestampNs = Long.MIN_VALUE
         lastOutputTimestampNs = Long.MIN_VALUE
+        estimatedAccelPeriodNs = 0.0
+        estimatedGyroPeriodNs = 0.0
     }
 
     private fun tryCreateSample(): Sample? {
@@ -59,7 +65,7 @@ class ImuSampleSynchronizer(
         val gyro = pendingGyro ?: return null
         val pairDeltaNs = abs(accel.timestampNs - gyro.timestampNs)
 
-        if (pairDeltaNs > maxPairDeltaNs) {
+        if (pairDeltaNs > currentPairDeltaLimitNs()) {
             // 时间差过大时保留较新的样本，等待另一类传感器追上，避免使用陈旧读数。
             if (accel.timestampNs < gyro.timestampNs) {
                 pendingAccel = null
@@ -83,8 +89,30 @@ class ImuSampleSynchronizer(
         )
     }
 
+    private fun updateEstimatedPeriod(currentEstimateNs: Double, previousTimestampNs: Long, timestampNs: Long): Double {
+        if (previousTimestampNs == Long.MIN_VALUE) return currentEstimateNs
+        val periodNs = timestampNs - previousTimestampNs
+        if (periodNs <= 0L || periodNs > MAX_VALID_SENSOR_PERIOD_NS) return currentEstimateNs
+        if (currentEstimateNs <= 0.0) return periodNs.toDouble()
+        return currentEstimateNs * (1.0 - PERIOD_EWMA_ALPHA) + periodNs * PERIOD_EWMA_ALPHA
+    }
+
+    private fun currentPairDeltaLimitNs(): Long {
+        // 两类传感器都获得稳定周期前沿用绝对上限，避免启动阶段误丢首批数据。
+        if (estimatedAccelPeriodNs <= 0.0 || estimatedGyroPeriodNs <= 0.0) return maxPairDeltaNs
+        val slowerPeriodNs = maxOf(estimatedAccelPeriodNs, estimatedGyroPeriodNs)
+        val minimumLimitNs = minOf(MIN_ADAPTIVE_PAIR_DELTA_NS, maxPairDeltaNs)
+        return (slowerPeriodNs * PAIR_DELTA_PERIOD_RATIO)
+            .toLong()
+            .coerceIn(minimumLimitNs, maxPairDeltaNs)
+    }
+
     companion object {
         // 兼容约 50 Hz 的传感器，同时拒绝明显跨周期的错误配对。
         const val DEFAULT_MAX_PAIR_DELTA_NS = 20_000_000L
+        const val MIN_ADAPTIVE_PAIR_DELTA_NS = 5_000_000L
+        const val MAX_VALID_SENSOR_PERIOD_NS = 100_000_000L
+        const val PAIR_DELTA_PERIOD_RATIO = 0.6
+        const val PERIOD_EWMA_ALPHA = 0.1
     }
 }
