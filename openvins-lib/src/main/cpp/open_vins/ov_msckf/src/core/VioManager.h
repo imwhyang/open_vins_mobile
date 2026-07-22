@@ -24,6 +24,7 @@
 
 #include <Eigen/StdVector>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <boost/filesystem.hpp>
 #include <fstream>
@@ -152,6 +153,16 @@ public:
   /// 返回最近一次 MSCKF 更新实际采用的特征数量，用于判断跟踪点中有多少通过了几何校验。
   size_t get_last_update_feature_count() { return good_features_MSCKF.size(); }
 
+  /// 返回最近一次 MSCKF 更新特征在 4x3 网格中的覆盖率。
+  double get_last_update_grid_coverage() { return last_update_grid_coverage; }
+
+  /// 返回最近一次 MSCKF 更新中占比最高网格的特征比例。
+  double get_last_update_max_grid_ratio() { return last_update_max_grid_ratio; }
+
+  double get_last_ransac_inlier_ratio() { return trackFEATS == nullptr ? 0.0 : trackFEATS->get_last_ransac_inlier_ratio(); }
+
+  size_t get_last_ransac_candidate_count() { return trackFEATS == nullptr ? 0 : trackFEATS->get_last_ransac_candidate_count(); }
+
   /// Returns if the latest camera update used a zero-velocity update.
   bool last_update_used_zupt() { return did_zupt_update; }
 
@@ -250,6 +261,8 @@ protected:
 
   // Good features that where used in the last update (used in visualization)
   std::vector<Eigen::Vector3d> good_features_MSCKF;
+  double last_update_grid_coverage = 0.0;
+  double last_update_max_grid_ratio = 0.0;
 
   // Re-triangulated features 3d positions seen from the current frame (used in visualization)
   // For each feature we have a linear system A * p_FinG = b we create and increment their costs

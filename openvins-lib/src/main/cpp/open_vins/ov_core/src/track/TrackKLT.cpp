@@ -846,6 +846,8 @@ void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::
   // If we don't have enough points for ransac just return empty
   // We set the mask to be all zeros since all points failed RANSAC
   if (pts0.size() < 10) {
+    last_ransac_candidate_count.store(pts0.size());
+    last_ransac_inlier_ratio.store(0.0);
     for (size_t i = 0; i < pts0.size(); i++)
       mask_out.push_back((uchar)0);
     return;
@@ -873,10 +875,20 @@ void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::
   cv::findFundamentalMat(pts0_n, pts1_n, cv::FM_RANSAC, 2.0 / max_focallength, 0.999, mask_rsc);
 
   // Loop through and record only ones that are valid
+  size_t klt_valid_count = 0;
+  size_t ransac_inlier_count = 0;
   for (size_t i = 0; i < mask_klt.size(); i++) {
+    if (mask_klt[i]) {
+      klt_valid_count++;
+    }
     auto mask = (uchar)((i < mask_klt.size() && mask_klt[i] && i < mask_rsc.size() && mask_rsc[i]) ? 1 : 0);
+    if (mask) {
+      ransac_inlier_count++;
+    }
     mask_out.push_back(mask);
   }
+  last_ransac_candidate_count.store(klt_valid_count);
+  last_ransac_inlier_ratio.store(klt_valid_count > 0 ? static_cast<double>(ransac_inlier_count) / klt_valid_count : 0.0);
 
   // Copy back the updated positions
   for (size_t i = 0; i < pts0.size(); i++) {

@@ -517,11 +517,76 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   };
   std::sort(featsup_MSCKF.begin(), featsup_MSCKF.end(), compare_feat);
 
+  // 候选特征超过更新上限时，不能只保留轨迹最长的点。动态目标或局部高纹理区域
+  // 可能提供大量长轨迹并主导滤波更新，因此先按 4x3 图像网格均衡选择，再用
+  // 剩余的长轨迹补足名额。候选不足时不删点，避免影响普通低纹理画面。
+  constexpr int update_grid_cols = 4;
+  constexpr int update_grid_rows = 3;
+  constexpr int update_grid_cells = update_grid_cols * update_grid_rows;
+  auto feature_grid_index = [&](const std::shared_ptr<Feature> &feature) -> int {
+    auto uv_it = feature->uvs.find(0);
+    auto camera_it = params.camera_intrinsics.find(0);
+    if (uv_it == feature->uvs.end() || uv_it->second.empty() || camera_it == params.camera_intrinsics.end()) {
+      return -1;
+    }
+    const Eigen::VectorXf &uv = uv_it->second.back();
+    const int width = camera_it->second->w();
+    const int height = camera_it->second->h();
+    if (uv.size() < 2 || width <= 0 || height <= 0 || uv(0) < 0.0f || uv(1) < 0.0f || uv(0) >= width || uv(1) >= height) {
+      return -1;
+    }
+    const int col = std::min(update_grid_cols - 1, static_cast<int>(uv(0) * update_grid_cols / width));
+    const int row = std::min(update_grid_rows - 1, static_cast<int>(uv(1) * update_grid_rows / height));
+    return row * update_grid_cols + col;
+  };
+
+  if ((int)featsup_MSCKF.size() > state->_options.max_msckf_in_update) {
+    const size_t update_limit = static_cast<size_t>(state->_options.max_msckf_in_update);
+    const size_t per_cell_limit = std::max<size_t>(1, (update_limit + update_grid_cells - 1) / update_grid_cells);
+    std::array<size_t, update_grid_cells> cell_counts{};
+    std::vector<bool> selected_flags(featsup_MSCKF.size(), false);
+    std::vector<std::shared_ptr<Feature>> balanced_features;
+    balanced_features.reserve(update_limit);
+
+    for (size_t offset = 0; offset < featsup_MSCKF.size() && balanced_features.size() < update_limit; ++offset) {
+      const size_t index = featsup_MSCKF.size() - 1 - offset;
+      const int cell = feature_grid_index(featsup_MSCKF[index]);
+      if (cell >= 0 && cell_counts[cell] < per_cell_limit) {
+        balanced_features.push_back(featsup_MSCKF[index]);
+        selected_flags[index] = true;
+        cell_counts[cell]++;
+      }
+    }
+    for (size_t offset = 0; offset < featsup_MSCKF.size() && balanced_features.size() < update_limit; ++offset) {
+      const size_t index = featsup_MSCKF.size() - 1 - offset;
+      if (!selected_flags[index]) {
+        balanced_features.push_back(featsup_MSCKF[index]);
+      }
+    }
+    featsup_MSCKF = std::move(balanced_features);
+  }
+
+  std::array<size_t, update_grid_cells> selected_cell_counts{};
+  size_t selected_with_grid = 0;
+  size_t occupied_cells = 0;
+  size_t max_cell_count = 0;
+  for (const auto &feature : featsup_MSCKF) {
+    const int cell = feature_grid_index(feature);
+    if (cell >= 0) {
+      selected_cell_counts[cell]++;
+      selected_with_grid++;
+    }
+  }
+  for (const size_t count : selected_cell_counts) {
+    if (count > 0) {
+      occupied_cells++;
+      max_cell_count = std::max(max_cell_count, count);
+    }
+  }
+  last_update_grid_coverage = static_cast<double>(occupied_cells) / update_grid_cells;
+  last_update_max_grid_ratio = selected_with_grid > 0 ? static_cast<double>(max_cell_count) / selected_with_grid : 0.0;
+
   // Pass them to our MSCKF updater
-  // NOTE: if we have more then the max, we select the "best" ones (i.e. max tracks) for this update
-  // NOTE: this should only really be used if you want to track a lot of features, or have limited computational resources
-  if ((int)featsup_MSCKF.size() > state->_options.max_msckf_in_update)
-    featsup_MSCKF.erase(featsup_MSCKF.begin(), featsup_MSCKF.end() - state->_options.max_msckf_in_update);
   updaterMSCKF->update(state, featsup_MSCKF);
   propagator->invalidate_cache();
   rT4 = boost::posix_time::microsec_clock::local_time();

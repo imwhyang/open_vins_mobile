@@ -151,6 +151,12 @@ public:
   /// Setter method for number of active features
   void set_num_features(int _num_features) { num_features = _num_features; }
 
+  /// 最近一次时序匹配中，RANSAC 内点占有效 KLT 光流点的比例。
+  double get_last_ransac_inlier_ratio() { return last_ransac_inlier_ratio.load(); }
+
+  /// 最近一次时序匹配中参与 RANSAC 统计的有效 KLT 光流点数量。
+  size_t get_last_ransac_candidate_count() { return last_ransac_candidate_count.load(); }
+
 protected:
   /// Camera object which has all calibration in it
   std::unordered_map<size_t, std::shared_ptr<CamBase>> camera_calib;
@@ -163,6 +169,9 @@ protected:
 
   /// Number of features we should try to track frame to frame
   int num_features;
+
+  std::atomic<double> last_ransac_inlier_ratio{1.0};
+  std::atomic<size_t> last_ransac_candidate_count{0};
 
   /// If we should use binocular tracking or stereo tracking for multi-camera
   bool use_stereo;

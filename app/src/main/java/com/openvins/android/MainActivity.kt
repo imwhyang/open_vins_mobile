@@ -385,7 +385,7 @@ class MainActivity : AppCompatActivity(), CameraFrameListener, SensorEventListen
         val visualRecoveryState = vioEngine.getVisualRecoveryState()
         if (visualRecoveryState != 0) {
             tvPose?.text = when (visualRecoveryState) {
-                1 -> "摄像头画面不可用，当前帧已过滤"
+                1 -> "摄像头画面不可用，轨迹暂不记录，请停止移动并恢复画面"
                 2 -> "初始化已完成，正在对齐上次轨迹，请继续正常移动"
                 3 -> "INIT 初始化中：保持画面清晰，缓慢移动手机以完成定位"
                 else -> ""

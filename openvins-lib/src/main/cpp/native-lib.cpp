@@ -161,6 +161,12 @@ std::atomic<int> visual_recovery_user_state(0);
 // 漂移后继续流程单独维护状态，避免摄像头遮挡状态将初始化提示覆盖。
 // 0=正常，2=VIO 已初始化并正在等待轨迹稳定，3=正在重新初始化 VIO。
 std::atomic<int> trajectory_recovery_user_state(0);
+// 画面质量过滤期间轨迹不会更新。恢复后的首个有效帧需要重新接到最后可靠点，
+// 否则过滤造成的轨迹缺口会被误认为持续漂移并触发重新 INIT。
+std::atomic<bool> camera_filter_recovery_pending(false);
+// 仅用于界面选择实时预览，不参与定位判断。过滤帧期间不能继续显示历史处理帧，
+// 否则用户看到的画面会像应用卡死一样停在原地。
+std::atomic<bool> camera_frame_filtered_for_display(false);
 
 void reset_visual_interruption_state() {
   std::lock_guard<std::mutex> lck(visual_interruption_mtx);
@@ -170,6 +176,8 @@ void reset_visual_interruption_state() {
   visual_interruption_active = false;
   visual_interruption_had_motion = false;
   visual_interruption_start_timestamp = -1.0;
+  camera_filter_recovery_pending.store(false);
+  camera_frame_filtered_for_display.store(false);
   visual_recovery_user_state.store(0);
   trajectory_recovery_user_state.store(0);
 }
@@ -252,8 +260,7 @@ CameraQuality evaluate_camera_quality(const cv::Mat &gray) {
   quality.blur_score = laplacian_stddev[0] * laplacian_stddev[0];
   quality.unusable_texture = quality.blur_score <= CAMERA_UNUSABLE_BLUR_MAX;
   quality.blocked = quality.dark_ratio >= CAMERA_BLOCKED_DARK_RATIO_MIN ||
-                    (quality.mean <= CAMERA_BLOCKED_MEAN_MAX && quality.stddev <= CAMERA_BLOCKED_STDDEV_MAX) ||
-                    quality.unusable_texture;
+                    (quality.mean <= CAMERA_BLOCKED_MEAN_MAX && quality.stddev <= CAMERA_BLOCKED_STDDEV_MAX);
   return quality;
 }
 
@@ -324,6 +331,25 @@ const size_t TRAJECTORY_DRIFT_PAUSE_STREAK = 3;
 const double TRAJECTORY_CONSISTENT_DRIFT_MIN_STEP_METERS = 0.12;
 const double TRAJECTORY_CONSISTENT_DRIFT_DIRECTION_DOT = 0.85;
 const double TRAJECTORY_CONSISTENT_DRIFT_STEP_RATIO = 0.45;
+const double TRAJECTORY_AUTO_RECOVERY_OBSERVE_SECONDS = 1.0;
+const double TRAJECTORY_AUTO_RECOVERY_MAX_WAIT_SECONDS = 2.5;
+const double TRAJECTORY_SOFT_RECOVERY_COOLDOWN_SECONDS = 20.0;
+const double TRAJECTORY_SOFT_RECOVERY_MAX_DISTANCE_METERS = 1.5;
+const double TRAJECTORY_BACKGROUND_REINIT_WAIT_SECONDS = 3.0;
+const double TRAJECTORY_BACKGROUND_REINIT_MIN_RANSAC_RATIO = 0.60;
+const size_t TRAJECTORY_SOFT_RECOVERY_MIN_UPDATE_FRAMES = 5;
+const size_t TRAJECTORY_SOFT_RECOVERY_MIN_UPDATE_FEATURES = 20;
+const double TRAJECTORY_STATIC_VISUAL_CONFLICT_METERS = 0.015;
+const double TRAJECTORY_STATIC_CONFLICT_RELEASE_GYRO_MEAN = 0.12;
+const double TRAJECTORY_STATIC_CONFLICT_RELEASE_ACCEL_STDDEV = 0.18;
+const size_t TRAJECTORY_STATIC_CONFLICT_RELEASE_FRAMES = 5;
+const double TRAJECTORY_FILTERED_ORIENTATION_GYRO_MEAN_MIN = 0.08;
+const size_t TRAJECTORY_RANSAC_MIN_CANDIDATES = 20;
+const double TRAJECTORY_RANSAC_MIN_INLIER_RATIO = 0.30;
+const double TRAJECTORY_RANSAC_RECOVERY_INLIER_RATIO = 0.45;
+const size_t TRAJECTORY_RANSAC_BAD_CONFIRM_FRAMES = 3;
+const size_t TRAJECTORY_RANSAC_GOOD_RECOVERY_FRAMES = 5;
+const double TRAJECTORY_RANSAC_REJECT_MIN_STEP_METERS = 0.03;
 
 enum TrajectoryRejectReason {
   TRAJECTORY_REJECT_NONE = 0,
@@ -338,6 +364,8 @@ enum TrajectoryRejectReason {
   TRAJECTORY_REJECT_LOW_FEATURE_TURN_JUMP = 9,
   TRAJECTORY_REJECT_SHIFTING_WINDOW = 10,
   TRAJECTORY_REJECT_VISUAL_INTERRUPTION_MOVED = 11,
+  TRAJECTORY_REJECT_STATIC_VISUAL_CONFLICT = 12,
+  TRAJECTORY_REJECT_LOW_RANSAC_INLIERS = 13,
 };
 const double TRAJECTORY_RESUME_GRACE_SECONDS = 2.0;
 double trajectory_debug_last_timestamp = -1.0;
@@ -358,6 +386,17 @@ double trajectory_strong_turn_protect_until_timestamp = -1.0;
 bool trajectory_has_last_drift_delta = false;
 Eigen::Vector3d trajectory_last_drift_delta(0.0, 0.0, 0.0);
 size_t trajectory_consistent_drift_count = 0;
+bool trajectory_auto_recovery_active = false;
+double trajectory_auto_recovery_start_timestamp = -1.0;
+double trajectory_last_soft_recovery_timestamp = -1.0;
+size_t trajectory_soft_recovery_count = 0;
+size_t trajectory_auto_recovery_update_frames = 0;
+size_t trajectory_auto_recovery_update_features = 0;
+bool trajectory_static_visual_conflict_active = false;
+size_t trajectory_static_conflict_motion_frames = 0;
+bool trajectory_dynamic_visual_inconsistent = false;
+size_t trajectory_ransac_bad_frames = 0;
+size_t trajectory_ransac_good_frames = 0;
 
 struct TrajectoryShiftSample {
   double timestamp;
@@ -431,7 +470,7 @@ bool compute_trajectory_delta(double timestamp, const Eigen::Vector3d &position,
 }
 
 bool should_accept_trajectory_point(double timestamp, const Eigen::Vector3d &position, const Eigen::Vector4d &quaternion,
-                                    size_t feature_count, int &reject_reason) {
+                                    size_t feature_count, bool dynamic_visual_inconsistent, int &reject_reason) {
   reject_reason = TRAJECTORY_REJECT_NONE;
 
   double dt = 0.0;
@@ -464,6 +503,12 @@ bool should_accept_trajectory_point(double timestamp, const Eigen::Vector3d &pos
     reject_reason = TRAJECTORY_REJECT_HIGH_SPEED;
     return false;
   }
+  if (step > TRAJECTORY_RANSAC_REJECT_MIN_STEP_METERS && dynamic_visual_inconsistent) {
+    // 多组独立运动持续存在时才过滤已有明显位移的点。单帧低内点率不会
+    // 直接影响正常轨迹，避免普通转弯和短暂模糊产生缺口。
+    reject_reason = TRAJECTORY_REJECT_LOW_RANSAC_INLIERS;
+    return false;
+  }
   if (step > TRAJECTORY_GATE_LOW_FEATURE_STEP_METERS && feature_count < TRAJECTORY_GATE_LOW_FEATURES) {
     reject_reason = TRAJECTORY_REJECT_LOW_FEATURE_JUMP;
     return false;
@@ -483,6 +528,33 @@ bool should_accept_trajectory_point(double timestamp, const Eigen::Vector3d &pos
   }
 
   return true;
+}
+
+void update_dynamic_visual_consistency(size_t candidate_count, double inlier_ratio) {
+  if (candidate_count < TRAJECTORY_RANSAC_MIN_CANDIDATES) {
+    // 候选点不足无法可靠判断多运动模型，保持当前状态但不累计进入或退出帧数。
+    trajectory_ransac_bad_frames = 0;
+    trajectory_ransac_good_frames = 0;
+    return;
+  }
+
+  if (inlier_ratio < TRAJECTORY_RANSAC_MIN_INLIER_RATIO) {
+    trajectory_ransac_bad_frames++;
+    trajectory_ransac_good_frames = 0;
+    if (trajectory_ransac_bad_frames >= TRAJECTORY_RANSAC_BAD_CONFIRM_FRAMES) {
+      trajectory_dynamic_visual_inconsistent = true;
+    }
+  } else if (inlier_ratio >= TRAJECTORY_RANSAC_RECOVERY_INLIER_RATIO) {
+    trajectory_ransac_good_frames++;
+    trajectory_ransac_bad_frames = 0;
+    if (trajectory_ransac_good_frames >= TRAJECTORY_RANSAC_GOOD_RECOVERY_FRAMES) {
+      trajectory_dynamic_visual_inconsistent = false;
+    }
+  } else {
+    // 中间区间作为滞回带，不允许一次边界波动改变状态。
+    trajectory_ransac_bad_frames = 0;
+    trajectory_ransac_good_frames = 0;
+  }
 }
 
 bool is_trajectory_drift_reason(int reject_reason) {
@@ -528,6 +600,13 @@ void reset_consistent_drift_detector() {
   trajectory_has_last_drift_delta = false;
   trajectory_last_drift_delta = Eigen::Vector3d::Zero();
   trajectory_consistent_drift_count = 0;
+}
+
+void reset_trajectory_auto_recovery() {
+  trajectory_auto_recovery_active = false;
+  trajectory_auto_recovery_start_timestamp = -1.0;
+  trajectory_auto_recovery_update_frames = 0;
+  trajectory_auto_recovery_update_features = 0;
 }
 
 bool update_consistent_drift_detector(const Eigen::Vector3d &position) {
@@ -839,10 +918,20 @@ void reset_trajectory_debug_state() {
   trajectory_clean_anchor = TrajectoryPoint(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0);
   trajectory_has_reliable_orientation = false;
   trajectory_reliable_orientation << 0.0, 0.0, 0.0, 1.0;
+  reset_trajectory_auto_recovery();
+  trajectory_last_soft_recovery_timestamp = -1.0;
+  trajectory_soft_recovery_count = 0;
+  trajectory_static_visual_conflict_active = false;
+  trajectory_static_conflict_motion_frames = 0;
+  trajectory_dynamic_visual_inconsistent = false;
+  trajectory_ransac_bad_frames = 0;
+  trajectory_ransac_good_frames = 0;
 }
 
 void record_trajectory_debug(double timestamp, const Eigen::Vector3d &position, const Eigen::Vector4d &quaternion, size_t trajectory_size,
-                             size_t feature_count, size_t update_feature_count, bool zupt_active, bool accepted, int reject_reason) {
+                             size_t feature_count, size_t update_feature_count, double update_grid_coverage,
+                             double update_max_grid_ratio, size_t ransac_candidate_count, double ransac_inlier_ratio,
+                             bool dynamic_visual_inconsistent, bool zupt_active, bool accepted, int reject_reason) {
   double qw = quaternion(3);
   double qx = quaternion(0);
   double qy = quaternion(1);
@@ -866,6 +955,9 @@ void record_trajectory_debug(double timestamp, const Eigen::Vector3d &position, 
                                        ? trajectory_size - trajectory_debug_session_start_size
                                        : 0;
   const double feature_use_ratio = feature_count > 0 ? static_cast<double>(update_feature_count) / static_cast<double>(feature_count) : 0.0;
+  const double auto_recovery_age = trajectory_auto_recovery_active && trajectory_auto_recovery_start_timestamp >= 0.0
+                                       ? timestamp - trajectory_auto_recovery_start_timestamp
+                                       : 0.0;
 
   if (compute_trajectory_delta(timestamp, position, quaternion, dt, step, speed, rot, forward_projection)) {
     anomaly = dt <= 0.0 || step > TRAJECTORY_DEBUG_JUMP_METERS || speed > TRAJECTORY_DEBUG_SPEED_MPS ||
@@ -881,7 +973,14 @@ void record_trajectory_debug(double timestamp, const Eigen::Vector3d &position, 
                          << "," << shifting_mileage << "," << (turning_in_place ? 1 : 0) << "," << (turn_protect_active ? 1 : 0)
                          << "," << (strong_turn_protect_active ? 1 : 0) << "," << (trajectory_resume_waiting_stable ? 1 : 0)
                          << "," << trajectory_resume_stable_count << "," << trajectory_consistent_drift_count << ","
-                         << latest_imu_pair_delta_seconds.load() << "," << update_feature_count << "," << feature_use_ratio << std::endl;
+                         << latest_imu_pair_delta_seconds.load() << "," << update_feature_count << "," << feature_use_ratio << ","
+                         << (trajectory_auto_recovery_active ? 1 : 0) << "," << auto_recovery_age << ","
+                         << trajectory_soft_recovery_count << "," << trajectory_auto_recovery_update_frames << ","
+                         << trajectory_auto_recovery_update_features << "," << update_grid_coverage << "," << update_max_grid_ratio
+                         << "," << ransac_candidate_count << "," << ransac_inlier_ratio
+                         << "," << (dynamic_visual_inconsistent ? 1 : 0) << "," << trajectory_ransac_bad_frames << ","
+                         << trajectory_ransac_good_frames
+                         << std::endl;
   }
 
   if (anomaly || !accepted) {
@@ -1127,6 +1226,19 @@ void processing_worker_thread() {
           trajectory_alignment_pending = false;
         }
         apply_trajectory_alignment(p_traj, q_cam);
+        const bool recovering_from_camera_filter = camera_filter_recovery_pending.exchange(false);
+        if (recovering_from_camera_filter && is_too_far_from_trajectory_end(p_traj)) {
+          // 被过滤帧没有可靠视觉约束，其间产生的位移不能作为漂移证据。恢复首帧只
+          // 重建坐标接续关系，不销毁 VIO；后续有效帧再从可靠终点继续记录轨迹。
+          rebase_alignment_to_trajectory_end(p_raw_for_alignment, q_raw_for_alignment);
+          p_traj = p_raw_for_alignment;
+          q_cam = q_raw_for_alignment;
+          apply_trajectory_alignment(p_traj, q_cam);
+          trajectory_shift_window.clear();
+          trajectory_drift_reject_streak = 0;
+          reset_consistent_drift_detector();
+          reset_trajectory_auto_recovery();
+        }
         if (trajectory_resume_grace_pending) {
           // 刚继续或重新初始化时，OpenVINS 可能有少量稳定过程。
           // 保护期内仍然丢弃异常点，但不立刻弹窗打断用户。
@@ -1142,17 +1254,55 @@ void processing_worker_thread() {
         }
         size_t feature_count = local_sys->get_last_track_count();
         size_t update_feature_count = local_sys->get_last_update_feature_count();
+        double update_grid_coverage = local_sys->get_last_update_grid_coverage();
+        double update_max_grid_ratio = local_sys->get_last_update_max_grid_ratio();
+        size_t ransac_candidate_count = local_sys->get_last_ransac_candidate_count();
+        double ransac_inlier_ratio = local_sys->get_last_ransac_inlier_ratio();
+        update_dynamic_visual_consistency(ransac_candidate_count, ransac_inlier_ratio);
         bool zupt_active = local_sys->last_update_used_zupt();
         int reject_reason = TRAJECTORY_REJECT_NONE;
         bool accept_trajectory_point = false;
         if (!trajectory_data_paused) {
+          Eigen::Vector3d reliable_end;
+          const bool has_reliable_end = get_last_trajectory_position(reliable_end);
+          const bool static_conflict_candidate = zupt_active && latest_imu_static.load() && has_reliable_end &&
+                                                 (p_traj - reliable_end).norm() > TRAJECTORY_STATIC_VISUAL_CONFLICT_METERS;
+          if (!trajectory_static_visual_conflict_active && static_conflict_candidate) {
+            trajectory_static_visual_conflict_active = true;
+            trajectory_static_conflict_motion_frames = 0;
+          }
+
+          if (trajectory_static_visual_conflict_active) {
+            const bool physical_motion_confirmed =
+                latest_imu_gyro_mean.load() > TRAJECTORY_STATIC_CONFLICT_RELEASE_GYRO_MEAN ||
+                latest_imu_accel_stddev.load() > TRAJECTORY_STATIC_CONFLICT_RELEASE_ACCEL_STDDEV;
+            trajectory_static_conflict_motion_frames =
+                physical_motion_confirmed ? trajectory_static_conflict_motion_frames + 1 : 0;
+            if (trajectory_static_conflict_motion_frames >= TRAJECTORY_STATIC_CONFLICT_RELEASE_FRAMES) {
+              // 只有 IMU 连续确认手机真实运动后才解除锁定。ZUPT 或静止标志的
+              // 单帧波动不能让方向框在可靠终点和错误 VIO 位姿之间来回跳。
+              trajectory_static_visual_conflict_active = false;
+              trajectory_static_conflict_motion_frames = 0;
+            }
+          }
+          const bool static_visual_conflict = trajectory_static_visual_conflict_active;
           bool turn_protected = update_turn_protection(state->_timestamp, p_traj, q_cam);
           // 先执行基础健康门控。此前该函数虽然存在但没有接入轨迹写入流程，
           // 导致几十米每秒的明显错误点仍可能被转弯保护分支接受。
           // 这类单点异常只静默过滤，不累计弹窗次数。
           const bool point_health_ok =
-              should_accept_trajectory_point(state->_timestamp, p_traj, q_cam, feature_count, reject_reason);
-          if (!point_health_ok) {
+              should_accept_trajectory_point(state->_timestamp, p_traj, q_cam, feature_count,
+                                             trajectory_dynamic_visual_inconsistent, reject_reason);
+          if (static_visual_conflict) {
+            // 手机被 IMU 和零速更新共同判定为静止时，视觉画面产生的位置变化
+            // 只能来自动态目标或错误特征。立即冻结显示和轨迹，不允许软恢复
+            // 把这个视觉假运动重新接到可靠终点。
+            reject_reason = TRAJECTORY_REJECT_STATIC_VISUAL_CONFLICT;
+            trajectory_shift_window.clear();
+            trajectory_drift_reject_streak = 0;
+            reset_consistent_drift_detector();
+            reset_trajectory_auto_recovery();
+          } else if (!point_health_ok) {
             trajectory_shift_window.clear();
             reset_consistent_drift_detector();
           } else if (is_turning_in_place(p_traj, q_cam)) {
@@ -1217,15 +1367,82 @@ void processing_worker_thread() {
           remember_trajectory_shift_sample(state->_timestamp, p_traj, trajectory_history.size());
           remember_reliable_orientation(q_cam);
           trajectory_drift_reject_streak = 0;
+          // 候选异常自行回到可接受状态时，直接结束观察，不打断用户。
+          reset_trajectory_auto_recovery();
         } else if (!trajectory_data_paused && is_trajectory_drift_reason(reject_reason)) {
           // 漂移候选点不会写入 trajectory_history。即使恢复保护期内不弹窗，
           // 可视轨迹也会停在最后一个可靠点，不会把异常点连成线。
+          if (latest_imu_gyro_mean.load() >= TRAJECTORY_FILTERED_ORIENTATION_GYRO_MEAN_MIN) {
+            // 过滤期间只冻结不可靠的位置。陀螺仪持续确认真实旋转时，保留已经
+            // 对齐到旧轨迹坐标系的当前方向，避免用户转身后方向退回过滤前。
+            // 手机静止、仅画面内目标运动时不会满足该条件。
+            remember_reliable_orientation(q_cam);
+          }
           if (suppress_pause_prompt) {
             trajectory_drift_reject_streak = 0;
+            reset_trajectory_auto_recovery();
           } else {
-            trajectory_drift_reject_streak++;
-            if (should_pause_for_trajectory_drift(reject_reason)) {
-              pause_trajectory_data(reject_reason);
+            if (!trajectory_auto_recovery_active) {
+              trajectory_auto_recovery_active = true;
+              trajectory_auto_recovery_start_timestamp = state->_timestamp;
+              trajectory_auto_recovery_update_frames = 0;
+              trajectory_auto_recovery_update_features = 0;
+              trajectory_drift_reject_streak = 0;
+            }
+
+            // 跟踪点总数不代表 VIO 已经重新获得视觉约束。只有真正参与滤波更新的
+            // 特征持续出现，才允许使用当前 VIO 位姿建立新的轨迹对齐关系。
+            if (update_feature_count > 0) {
+              trajectory_auto_recovery_update_frames++;
+              trajectory_auto_recovery_update_features += update_feature_count;
+            }
+
+            const double observe_age = state->_timestamp - trajectory_auto_recovery_start_timestamp;
+            const bool visual_update_ready =
+                trajectory_auto_recovery_update_frames >= TRAJECTORY_SOFT_RECOVERY_MIN_UPDATE_FRAMES &&
+                trajectory_auto_recovery_update_features >= TRAJECTORY_SOFT_RECOVERY_MIN_UPDATE_FEATURES;
+            Eigen::Vector3d soft_recovery_end;
+            const bool has_soft_recovery_end = get_last_trajectory_position(soft_recovery_end);
+            const double recovery_distance = has_soft_recovery_end ? (p_traj - soft_recovery_end).norm() : 0.0;
+            const bool recovery_distance_safe =
+                !has_soft_recovery_end || recovery_distance <= TRAJECTORY_SOFT_RECOVERY_MAX_DISTANCE_METERS;
+            const bool recovery_cooldown_ready = trajectory_last_soft_recovery_timestamp < 0.0 ||
+                                                 state->_timestamp - trajectory_last_soft_recovery_timestamp >=
+                                                     TRAJECTORY_SOFT_RECOVERY_COOLDOWN_SECONDS;
+            const bool soft_recovery_available = recovery_distance_safe && recovery_cooldown_ready;
+            if (observe_age >= TRAJECTORY_AUTO_RECOVERY_OBSERVE_SECONDS && soft_recovery_available && visual_update_ready) {
+              // 不销毁 VIO，只把当前局部坐标重新接到最后可靠轨迹点。观察期间的异常点
+              // 从未写入轨迹，因此不会出现一条长线连到漂移位置。
+              rebase_alignment_to_trajectory_end(p_raw_for_alignment, q_raw_for_alignment);
+              p_traj = p_raw_for_alignment;
+              q_cam = q_raw_for_alignment;
+              apply_trajectory_alignment(p_traj, q_cam);
+              trajectory_last_soft_recovery_timestamp = state->_timestamp;
+              trajectory_soft_recovery_count++;
+              trajectory_drift_reject_streak = 0;
+              trajectory_shift_window.clear();
+              reset_consistent_drift_detector();
+              reset_trajectory_auto_recovery();
+              __android_log_print(ANDROID_LOG_INFO, TAG, "Trajectory soft recovery applied at %.6f (count=%zu)\n",
+                                  state->_timestamp, trajectory_soft_recovery_count);
+            } else if (observe_age >= TRAJECTORY_AUTO_RECOVERY_MAX_WAIT_SECONDS && !visual_update_ready) {
+              // 没有有效视觉更新时继续冻结并过滤异常点，不重建 VIO、不打断用户。
+              // 后续视觉重新稳定后仍可使用同一个观察窗口完成软对齐。
+              trajectory_drift_reject_streak = 0;
+            } else if (observe_age >= TRAJECTORY_AUTO_RECOVERY_OBSERVE_SECONDS && !soft_recovery_available) {
+              // 大于 1.5 米的偏移已经不是坐标接续误差，软对齐会掩盖失稳的速度和
+              // 航向状态；短时间复发也说明上次对齐没有修好估计器。两种情况均只
+              // 冻结和过滤，不把错误状态重新接入可靠轨迹。
+              trajectory_drift_reject_streak = 0;
+              if (!recovery_distance_safe && observe_age >= TRAJECTORY_BACKGROUND_REINIT_WAIT_SECONDS && visual_update_ready &&
+                  ransac_candidate_count >= TRAJECTORY_RANSAC_MIN_CANDIDATES &&
+                  ransac_inlier_ratio >= TRAJECTORY_BACKGROUND_REINIT_MIN_RANSAC_RATIO &&
+                  !trajectory_dynamic_visual_inconsistent) {
+                // 已确认旧 VIO 严重失稳时统一进入暂停弹窗，不再后台自动 INIT。
+                // 只有用户点击“继续”后才重建 VIO，避免运行中无感知地突然初始化。
+                pause_trajectory_data(TRAJECTORY_REJECT_SHIFTING_WINDOW);
+                reset_trajectory_auto_recovery();
+              }
             }
           }
         } else if (!trajectory_data_paused) {
@@ -1235,8 +1452,9 @@ void processing_worker_thread() {
           accept_trajectory_point = false;
           reject_reason = trajectory_pause_reason;
         }
-        record_trajectory_debug(state->_timestamp, p_traj, q_cam, trajectory_history.size(), feature_count, update_feature_count, zupt_active,
-                                accept_trajectory_point, reject_reason);
+        record_trajectory_debug(state->_timestamp, p_traj, q_cam, trajectory_history.size(), feature_count, update_feature_count,
+                                update_grid_coverage, update_max_grid_ratio, ransac_candidate_count, ransac_inlier_ratio,
+                                trajectory_dynamic_visual_inconsistent, zupt_active, accept_trajectory_point, reject_reason);
 
         // Display the current state
         std::stringstream ss1, ss2, ss3;
@@ -1333,7 +1551,9 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setRecordS
                             "forward_projection,turn_guard_active,accepted,reject_reason,anomaly,session_trajectory_size,"
                             "distance_to_trajectory_end_m,shifting_mileage_m,turning_in_place,turn_protect_active,"
                             "strong_turn_protect_active,resume_waiting_stable,resume_stable_count,consistent_drift_count,imu_pair_delta_s"
-                            ",update_feature_count,feature_use_ratio"
+                            ",update_feature_count,feature_use_ratio,auto_recovery_active,auto_recovery_age_s,soft_recovery_count,"
+                            "auto_recovery_update_frames,auto_recovery_update_features,update_grid_coverage,update_max_grid_ratio,"
+                            "ransac_candidate_count,ransac_inlier_ratio,dynamic_visual_inconsistent,ransac_bad_frames,ransac_good_frames"
                          << std::endl;
     std::string camera_quality_csv_name = s + "camera_quality_debug.csv";
     camera_quality_debug_csv.open(save_folder + camera_quality_csv_name);
@@ -1467,6 +1687,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_toggleSyst
       reset_imu_motion_state();
     }
     reset_visual_interruption_state();
+    // 点击开始后立即显示初始化状态，不等待首批相机帧和 IMU 数据进入估计器。
+    trajectory_recovery_user_state.store(3);
 
     // Reset visualization state
     viz_time = -1;
@@ -1639,15 +1861,20 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_getDispla
     // Convert RGBA to RGB for display
     cv::Mat *rgbMat = new cv::Mat();
     cv::cvtColor(rawMat, *rgbMat, cv::COLOR_RGBA2GRAY);
+    if (is_running_ov && trajectory_recovery_user_state.load() == 3) {
+      // VIO 对象创建前也立即给出 INIT 反馈，避免用户误以为点击开始没有生效。
+      cv::putText(*rgbMat, "INIT", cv::Point(24, 48), cv::FONT_HERSHEY_SIMPLEX, 1.2, cv::Scalar(255), 2, cv::LINE_AA);
+    }
     return reinterpret_cast<jlong>(rgbMat);
   }
 
-  if (visual_recovery_user_state.load() != 0 && rawCameraMatAddr != 0) {
-    // 视觉中断期间显示真实实时画面，状态原因由界面文字说明；
-    // 不显示冻结的旧关键点，避免用户误以为遮挡画面仍在参与定位。
+  if ((visual_recovery_user_state.load() != 0 || camera_frame_filtered_for_display.load()) && rawCameraMatAddr != 0) {
+    // 真正过滤图像帧时改用实时预览，避免继续展示冻结的历史关键点画面。
+    // 小标识只说明当前帧未参与定位，不覆盖主状态文字，也不触发 INIT。
     cv::Mat &rawMat = *(cv::Mat *)rawCameraMatAddr;
     cv::Mat *rgbMat = new cv::Mat();
     cv::cvtColor(rawMat, *rgbMat, cv::COLOR_RGBA2GRAY);
+    cv::putText(*rgbMat, "FILTER", cv::Point(24, 42), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255), 1, cv::LINE_AA);
     return reinterpret_cast<jlong>(rgbMat);
   }
 
@@ -1660,6 +1887,10 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_getDispla
       cv::Mat &rawMat = *(cv::Mat *)rawCameraMatAddr;
       cv::Mat *rgbMat = new cv::Mat();
       cv::cvtColor(rawMat, *rgbMat, cv::COLOR_RGBA2GRAY);
+      if (trajectory_recovery_user_state.load() == 3) {
+        // VIO 已创建但首张可视化图尚未生成时，也不能让 INIT 提示短暂消失。
+        cv::putText(*rgbMat, "INIT", cv::Point(24, 48), cv::FONT_HERSHEY_SIMPLEX, 1.2, cv::Scalar(255), 2, cv::LINE_AA);
+      }
       return reinterpret_cast<jlong>(rgbMat);
     }
     return 0;
@@ -1667,6 +1898,11 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_getDispla
 
   // Clone the viz image and apply overlays
   cv::Mat *displayMat = new cv::Mat(viz_img.clone());
+
+  if (trajectory_recovery_user_state.load() == 3) {
+    // 无论 VIO 对象和历史可视化图是否已创建，点击开始后都立即展示 INIT。
+    cv::putText(*displayMat, "INIT", cv::Point(24, 48), cv::FONT_HERSHEY_SIMPLEX, 1.2, cv::Scalar(255), 2, cv::LINE_AA);
+  }
 
   // Apply overlays (framerate, recording status, state info)
   std::string framerate_str = std::to_string((int)(viz_track_rate)) + "hz";
@@ -1843,7 +2079,12 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIma
     bool interruption_had_motion = false;
     const bool motion_blurred = camera_quality.blur_score <= CAMERA_MOTION_BLUR_MAX &&
                                 latest_imu_gyro_norm.load() >= CAMERA_MOTION_BLUR_GYRO_MIN;
+    // 白墙等低纹理画面只影响定位数据，不等同于摄像头被遮挡。只有 blocked
+    // 状态才切换用户提示和相机展示，避免关键点画面与原始画面反复闪动。
+    // 低纹理不等于无效图像：继续送入 OpenVINS，保持相机时间轴和可视化连续，
+    // 再由特征数量及轨迹健康门控决定是否记录点位。只有明确遮挡或高速模糊才丢帧。
     const bool frame_filtered = camera_quality.blocked || motion_blurred;
+    camera_frame_filtered_for_display.store(frame_filtered);
     {
       std::lock_guard<std::mutex> state_lck(visual_interruption_mtx);
       if (camera_quality.blocked) {
@@ -1906,6 +2147,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIma
     if (frame_filtered) {
       // 遮挡、低纹理或高速旋转下的严重模糊帧不能提供可靠视觉约束。
       // 这里只过滤当前图像帧，IMU 与相机预览保持连续，也不会触发重新初始化。
+      camera_filter_recovery_pending.store(true);
       __android_log_print(ANDROID_LOG_WARN, TAG,
                           "Dropping low-quality camera frame: mean=%.2f std=%.2f dark=%.3f blur=%.2f gyro=%.3f blocked=%d motion_blur=%d\n",
                           camera_quality.mean, camera_quality.stddev, camera_quality.dark_ratio, camera_quality.blur_score,
@@ -2141,12 +2383,20 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_openvins_android_VioEngine_getCur
   Eigen::Vector3d p_cam = p_IinG - ov_core::quat_2_Rot(q_cam).transpose() * p_IinC;
   {
     std::lock_guard<std::mutex> traj_lck(trajectory_mtx);
-    if (trajectory_data_paused || trajectory_alignment_pending || trajectory_resume_waiting_stable) {
-      // 暂停或等待继续对齐时，方向框固定在轨迹线最后一点。
-      // 只有第一帧对齐完成后，才重新显示经过刚体变换后的 VIO 当前位姿。
+    if (trajectory_data_paused || trajectory_alignment_pending || trajectory_resume_waiting_stable ||
+        trajectory_static_visual_conflict_active) {
+      // 暂停、等待继续对齐或自动恢复观察期间，方向框固定在轨迹线最后一点。
+      // 只有恢复完成后，才重新显示经过刚体变换后的 VIO 当前位姿。
       get_last_trajectory_pose_for_display(p_cam, q_cam);
     } else if (trajectory_alignment_active) {
       apply_trajectory_alignment(p_cam, q_cam);
+    }
+    Eigen::Vector3d reliable_position;
+    if (get_last_trajectory_position(reliable_position) &&
+        (p_cam - reliable_position).norm() > TRAJECTORY_MAX_CONNECT_STEP_METERS) {
+      // 显示是否固定只由“当前位姿是否已明显跑远”决定，不再跟随过滤状态开关。
+      // 这样既不显示远处错误方向框，也不会因过滤标志抖动而来回切换。
+      get_last_trajectory_pose_for_display(p_cam, q_cam);
     }
   }
 
@@ -2217,7 +2467,10 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_openvins_android_VioEngine_isTraj
 extern "C" JNIEXPORT jint JNICALL Java_com_openvins_android_VioEngine_getVisualRecoveryStateJNI(JNIEnv *env, jobject instance) {
   // 漂移恢复提示优先级高于遮挡提示，两个状态不再互相清除。
   const int trajectory_state = trajectory_recovery_user_state.load();
-  return static_cast<jint>(trajectory_state != 0 ? trajectory_state : visual_recovery_user_state.load());
+  if (trajectory_state != 0) {
+    return static_cast<jint>(trajectory_state);
+  }
+  return static_cast<jint>(visual_recovery_user_state.load());
 }
 
 extern "C" JNIEXPORT jint JNICALL Java_com_openvins_android_VioEngine_getTrajectoryPauseReasonJNI(JNIEnv *env, jobject instance) {
@@ -2238,7 +2491,15 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_resumeTraj
     trajectory_resume_stable_count = 0;
     trajectory_turn_protect_until_timestamp = -1.0;
     trajectory_strong_turn_protect_until_timestamp = -1.0;
+    trajectory_static_visual_conflict_active = false;
+    trajectory_static_conflict_motion_frames = 0;
+    trajectory_dynamic_visual_inconsistent = false;
+    trajectory_ransac_bad_frames = 0;
+    trajectory_ransac_good_frames = 0;
     reset_consistent_drift_detector();
+    reset_trajectory_auto_recovery();
+    // 完整重新初始化后允许新 VIO 状态再次使用一次静默软恢复机会。
+    trajectory_last_soft_recovery_timestamp = -1.0;
     trajectory_shift_window.clear();
     trajectory_debug_last_timestamp = -1.0;
     trajectory_turn_guard_until_timestamp = -1.0;
