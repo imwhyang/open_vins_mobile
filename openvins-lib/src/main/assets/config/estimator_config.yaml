@@ -9,7 +9,7 @@ max_cameras: 1 # how many cameras we have 1 = mono, 2 = stereo, >2 = binocular (
 
 calib_cam_extrinsics: true # if the transform between camera and IMU should be optimized R_ItoC, p_CinI
 calib_cam_intrinsics: true # if camera intrinsics should be optimized (focal, center, distortion)
-calib_cam_timeoffset: false # if timeoffset between camera and IMU should be optimized
+calib_cam_timeoffset: true # 在线估计相机与 IMU 时间偏移，减少快速调头时旋转被误解为平移
 calib_imu_intrinsics: false # if imu intrinsics should be calibrated (rotation and skew-scale matrix)
 calib_imu_g_sensitivity: false # if gyroscope gravity sensitivity (Tg) should be calibrated
 
@@ -119,7 +119,6 @@ use_mask: false
 # imu config should also have the correct noise values
 relative_config_imu: "kalibr_imu_chain.yaml"
 relative_config_imucam: "kalibr_imucam_chain.yaml"
-
 
 
 

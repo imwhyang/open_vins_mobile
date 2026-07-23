@@ -316,7 +316,9 @@ const double TRAJECTORY_TURN_GUARD_FAST_STEP_METERS = 0.05;
 const double TRAJECTORY_TURN_GUARD_LOW_FEATURE_STEP_METERS = 0.12;
 const size_t TRAJECTORY_TURN_GUARD_LOW_FEATURES = 80;
 const double TRAJECTORY_SHIFT_WINDOW_SECONDS = 0.5;
-const double TRAJECTORY_SHIFT_MAX_MILEAGE_METERS = 1.0;
+// 真实快速行走同样会表现为连续同方向、相近步长。原 1 米阈值等价于 2m/s，
+// 会把调头后加速直行误判成漂移并回退轨迹；放宽后仍低于 5m/s 的高速硬门控。
+const double TRAJECTORY_SHIFT_MAX_MILEAGE_METERS = 1.75;
 const double TRAJECTORY_MAX_CONNECT_STEP_METERS = 0.45;
 const double TRAJECTORY_TURN_IN_PLACE_ROT_RAD = 0.12;
 const double TRAJECTORY_TURN_IN_PLACE_MAX_STEP_METERS = 0.08;
@@ -350,6 +352,7 @@ const double TRAJECTORY_RANSAC_RECOVERY_INLIER_RATIO = 0.45;
 const size_t TRAJECTORY_RANSAC_BAD_CONFIRM_FRAMES = 3;
 const size_t TRAJECTORY_RANSAC_GOOD_RECOVERY_FRAMES = 5;
 const double TRAJECTORY_RANSAC_REJECT_MIN_STEP_METERS = 0.03;
+const size_t TRAJECTORY_PERSISTENT_SEVERE_REJECT_FRAMES = 30;
 
 enum TrajectoryRejectReason {
   TRAJECTORY_REJECT_NONE = 0,
@@ -366,6 +369,7 @@ enum TrajectoryRejectReason {
   TRAJECTORY_REJECT_VISUAL_INTERRUPTION_MOVED = 11,
   TRAJECTORY_REJECT_STATIC_VISUAL_CONFLICT = 12,
   TRAJECTORY_REJECT_LOW_RANSAC_INLIERS = 13,
+  TRAJECTORY_REJECT_PERSISTENT_ESTIMATOR_FAILURE = 14,
 };
 const double TRAJECTORY_RESUME_GRACE_SECONDS = 2.0;
 double trajectory_debug_last_timestamp = -1.0;
@@ -397,6 +401,11 @@ size_t trajectory_static_conflict_motion_frames = 0;
 bool trajectory_dynamic_visual_inconsistent = false;
 size_t trajectory_ransac_bad_frames = 0;
 size_t trajectory_ransac_good_frames = 0;
+size_t trajectory_persistent_severe_reject_count = 0;
+// 猪圈拍摄人员在同一地面行走，业务轨迹使用首个可靠点所在的重力对齐平面。
+// 仅约束轨迹输出和健康判断，不修改 OpenVINS 内部状态。
+bool trajectory_has_ground_plane = false;
+double trajectory_ground_z = 0.0;
 
 struct TrajectoryShiftSample {
   double timestamp;
@@ -926,12 +935,15 @@ void reset_trajectory_debug_state() {
   trajectory_dynamic_visual_inconsistent = false;
   trajectory_ransac_bad_frames = 0;
   trajectory_ransac_good_frames = 0;
+  trajectory_persistent_severe_reject_count = 0;
 }
 
 void record_trajectory_debug(double timestamp, const Eigen::Vector3d &position, const Eigen::Vector4d &quaternion, size_t trajectory_size,
                              size_t feature_count, size_t update_feature_count, double update_grid_coverage,
                              double update_max_grid_ratio, size_t ransac_candidate_count, double ransac_inlier_ratio,
-                             bool dynamic_visual_inconsistent, bool zupt_active, bool accepted, int reject_reason) {
+                             bool dynamic_visual_inconsistent, double raw_position_z, double vertical_error,
+                             double estimated_camimu_dt, double estimated_fx, double estimated_fy,
+                             bool zupt_active, bool accepted, int reject_reason) {
   double qw = quaternion(3);
   double qx = quaternion(0);
   double qy = quaternion(1);
@@ -979,7 +991,9 @@ void record_trajectory_debug(double timestamp, const Eigen::Vector3d &position, 
                          << trajectory_auto_recovery_update_features << "," << update_grid_coverage << "," << update_max_grid_ratio
                          << "," << ransac_candidate_count << "," << ransac_inlier_ratio
                          << "," << (dynamic_visual_inconsistent ? 1 : 0) << "," << trajectory_ransac_bad_frames << ","
-                         << trajectory_ransac_good_frames
+                         << trajectory_ransac_good_frames << "," << raw_position_z << "," << vertical_error << ","
+                         << trajectory_persistent_severe_reject_count << "," << estimated_camimu_dt << ","
+                         << estimated_fx << "," << estimated_fy
                          << std::endl;
   }
 
@@ -1226,6 +1240,15 @@ void processing_worker_thread() {
           trajectory_alignment_pending = false;
         }
         apply_trajectory_alignment(p_traj, q_cam);
+        const double raw_trajectory_z = p_traj(2);
+        if (!trajectory_has_ground_plane) {
+          // OpenVINS 全局坐标已经与重力对齐，Z 轴是高度。首个定位点定义本次
+          // 业务轨迹的地面平面，重新初始化接续旧轨迹时继续沿用同一平面。
+          trajectory_ground_z = trajectory_history.empty() ? raw_trajectory_z : trajectory_history.front().z;
+          trajectory_has_ground_plane = true;
+        }
+        const double trajectory_vertical_error = raw_trajectory_z - trajectory_ground_z;
+        p_traj(2) = trajectory_ground_z;
         const bool recovering_from_camera_filter = camera_filter_recovery_pending.exchange(false);
         if (recovering_from_camera_filter && is_too_far_from_trajectory_end(p_traj)) {
           // 被过滤帧没有可靠视觉约束，其间产生的位移不能作为漂移证据。恢复首帧只
@@ -1448,13 +1471,32 @@ void processing_worker_thread() {
         } else if (!trajectory_data_paused) {
           trajectory_drift_reject_streak = 0;
         }
+        if (!trajectory_data_paused) {
+          if (accept_trajectory_point) {
+            // 只要重新出现一个可靠点，就说明本轮连续失控已经结束。
+            trajectory_persistent_severe_reject_count = 0;
+          } else if (reject_reason == TRAJECTORY_REJECT_LARGE_JUMP ||
+                     reject_reason == TRAJECTORY_REJECT_HIGH_SPEED ||
+                     reject_reason == TRAJECTORY_REJECT_BACKWARD_AFTER_TURN) {
+            // 单次跳点和普通转弯继续静默过滤；只有估计器长时间连续输出明显
+            // 不可能的位移且始终没有可靠点恢复时，才升级为用户可感知的暂停。
+            trajectory_persistent_severe_reject_count++;
+            if (trajectory_persistent_severe_reject_count >= TRAJECTORY_PERSISTENT_SEVERE_REJECT_FRAMES) {
+              pause_trajectory_data(TRAJECTORY_REJECT_PERSISTENT_ESTIMATOR_FAILURE);
+            }
+          }
+        }
         if (trajectory_data_paused) {
           accept_trajectory_point = false;
           reject_reason = trajectory_pause_reason;
         }
+        const double estimated_camimu_dt = state->_calib_dt_CAMtoIMU->value()(0);
+        const Eigen::VectorXd estimated_camera_intrinsics = state->_cam_intrinsics.at(0)->value();
         record_trajectory_debug(state->_timestamp, p_traj, q_cam, trajectory_history.size(), feature_count, update_feature_count,
                                 update_grid_coverage, update_max_grid_ratio, ransac_candidate_count, ransac_inlier_ratio,
-                                trajectory_dynamic_visual_inconsistent, zupt_active, accept_trajectory_point, reject_reason);
+                                trajectory_dynamic_visual_inconsistent, raw_trajectory_z, trajectory_vertical_error,
+                                estimated_camimu_dt, estimated_camera_intrinsics(0), estimated_camera_intrinsics(1),
+                                zupt_active, accept_trajectory_point, reject_reason);
 
         // Display the current state
         std::stringstream ss1, ss2, ss3;
@@ -1553,7 +1595,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setRecordS
                             "strong_turn_protect_active,resume_waiting_stable,resume_stable_count,consistent_drift_count,imu_pair_delta_s"
                             ",update_feature_count,feature_use_ratio,auto_recovery_active,auto_recovery_age_s,soft_recovery_count,"
                             "auto_recovery_update_frames,auto_recovery_update_features,update_grid_coverage,update_max_grid_ratio,"
-                            "ransac_candidate_count,ransac_inlier_ratio,dynamic_visual_inconsistent,ransac_bad_frames,ransac_good_frames"
+                            "ransac_candidate_count,ransac_inlier_ratio,dynamic_visual_inconsistent,ransac_bad_frames,ransac_good_frames,"
+                            "raw_p_z,vertical_error_m,persistent_severe_reject_count,estimated_camimu_dt_s,estimated_fx,estimated_fy"
                          << std::endl;
     std::string camera_quality_csv_name = s + "camera_quality_debug.csv";
     camera_quality_debug_csv.open(save_folder + camera_quality_csv_name);
@@ -1659,6 +1702,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_toggleSyst
     {
       std::lock_guard<std::mutex> traj_lck(trajectory_mtx);
       trajectory_history.clear();
+      trajectory_has_ground_plane = false;
+      trajectory_ground_z = 0.0;
     }
     reset_trajectory_debug_state();
     {
@@ -2081,9 +2126,10 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIma
                                 latest_imu_gyro_norm.load() >= CAMERA_MOTION_BLUR_GYRO_MIN;
     // 白墙等低纹理画面只影响定位数据，不等同于摄像头被遮挡。只有 blocked
     // 状态才切换用户提示和相机展示，避免关键点画面与原始画面反复闪动。
-    // 低纹理不等于无效图像：继续送入 OpenVINS，保持相机时间轴和可视化连续，
-    // 再由特征数量及轨迹健康门控决定是否记录点位。只有明确遮挡或高速模糊才丢帧。
-    const bool frame_filtered = camera_quality.blocked || motion_blurred;
+    // 调头时连续丢弃运动模糊帧会让航向在关键旋转区间只能依赖陀螺仪积分，
+    // 某次角度误差随后会持续影响整段轨迹。模糊和低纹理帧仍送入 OpenVINS，
+    // 由 KLT/RANSAC 及轨迹健康门控淘汰错误匹配；只有明确遮挡才整帧过滤。
+    const bool frame_filtered = camera_quality.blocked;
     camera_frame_filtered_for_display.store(frame_filtered);
     {
       std::lock_guard<std::mutex> state_lck(visual_interruption_mtx);
@@ -2391,6 +2437,11 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_openvins_android_VioEngine_getCur
     } else if (trajectory_alignment_active) {
       apply_trajectory_alignment(p_cam, q_cam);
     }
+    if (trajectory_has_ground_plane) {
+      // 方向框与业务轨迹使用同一地面平面。原始高度漂移不能再把方向框误判为
+      // “远离轨迹终点”，也不会造成方向框被长时间固定在旧位置。
+      p_cam(2) = trajectory_ground_z;
+    }
     Eigen::Vector3d reliable_position;
     if (get_last_trajectory_position(reliable_position) &&
         (p_cam - reliable_position).norm() > TRAJECTORY_MAX_CONNECT_STEP_METERS) {
@@ -2496,6 +2547,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_resumeTraj
     trajectory_dynamic_visual_inconsistent = false;
     trajectory_ransac_bad_frames = 0;
     trajectory_ransac_good_frames = 0;
+    trajectory_persistent_severe_reject_count = 0;
     reset_consistent_drift_detector();
     reset_trajectory_auto_recovery();
     // 完整重新初始化后允许新 VIO 状态再次使用一次静默软恢复机会。
