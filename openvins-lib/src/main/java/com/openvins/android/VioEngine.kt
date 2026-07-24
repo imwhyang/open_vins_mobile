@@ -80,6 +80,14 @@ class VioEngine {
     }
 
     /**
+     * 配置是否生成轨迹和相机质量调试日志，默认关闭。
+     * 请在开始录制前设置；关闭时仅保留 pose0.csv。
+     */
+    fun setDebugLoggingEnabled(enabled: Boolean) {
+        setDebugLoggingEnabledJNI(enabled)
+    }
+
+    /**
      * 启动或停止 OpenVINS 系统。
      * @param running true 启动系统，false 停止系统
      */
@@ -146,6 +154,16 @@ class VioEngine {
         return getVisualRecoveryStateJNI()
     }
 
+    /** 获取结构化定位状态，具体状态码由 SDK 层转换为 OpenVinsTrackingState。 */
+    fun getTrackingState(): Int {
+        return getTrackingStateJNI()
+    }
+
+    /** 是否在相机画面显示原生 init/zvupt 调试文字。 */
+    fun setStatusOverlayEnabled(enabled: Boolean) {
+        setStatusOverlayEnabledJNI(enabled)
+    }
+
     fun getTrajectoryPauseReason(): Int {
         return getTrajectoryPauseReasonJNI()
     }
@@ -190,6 +208,7 @@ class VioEngine {
     private external fun setAppRecordFolderJNI(dir: String)
     private external fun setAppPrivateFolderJNI(dir: String)
     private external fun setRecordStateJNI(state: Boolean)
+    private external fun setDebugLoggingEnabledJNI(enabled: Boolean)
     private external fun toggleSystemJNI(state: Boolean)
     private external fun processImageJNI(matAddr: Long, timestampSec: Double)
     private external fun processInertialJNI(
@@ -202,6 +221,8 @@ class VioEngine {
     private external fun getTrajectoryDataJNI(positions: DoubleArray, quaternions: DoubleArray): Int
     private external fun isTrajectoryPausedJNI(): Boolean
     private external fun getVisualRecoveryStateJNI(): Int
+    private external fun getTrackingStateJNI(): Int
+    private external fun setStatusOverlayEnabledJNI(enabled: Boolean)
     private external fun getTrajectoryPauseReasonJNI(): Int
     private external fun resumeTrajectoryJNI()
     private external fun processYUVToRGBAJNI(

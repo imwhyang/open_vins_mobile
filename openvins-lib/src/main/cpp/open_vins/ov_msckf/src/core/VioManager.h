@@ -99,6 +99,9 @@ public:
   /// If we are initialized or not
   bool initialized() { return is_initialized_vio && timelastupdate != -1; }
 
+  /// 与相机画面 init/zvupt 文字共用的 VIO 初始化标志
+  bool vio_initialized() { return is_initialized_vio; }
+
   /// Timestamp that the system was initialized at
   double initialized_time() { return startup_time; }
 
@@ -112,7 +115,7 @@ public:
   std::shared_ptr<Propagator> get_propagator() { return propagator; }
 
   /// Get a nice visualization image of what tracks we have
-  cv::Mat get_historical_viz_image();
+  cv::Mat get_historical_viz_image(bool show_status_overlay = true);
 
   /// Returns 3d SLAM features in the global frame
   std::vector<Eigen::Vector3d> get_features_SLAM();

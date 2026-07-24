@@ -44,6 +44,7 @@
 #define TAG "OpenVINSNative"
 
 bool is_recording = false;
+std::atomic<bool> debug_logging_enabled(false);
 bool is_running_ov = false;
 bool app_record_folder_set = false;
 std::string app_record_folder = "/sdcard/";  // Public directory for recordings (user accessible)
@@ -167,6 +168,8 @@ std::atomic<bool> camera_filter_recovery_pending(false);
 // 仅用于界面选择实时预览，不参与定位判断。过滤帧期间不能继续显示历史处理帧，
 // 否则用户看到的画面会像应用卡死一样停在原地。
 std::atomic<bool> camera_frame_filtered_for_display(false);
+// 示例和调试默认保留 OpenVINS 原生状态文字，JitPack 宿主可关闭后使用状态回调。
+std::atomic<bool> status_overlay_enabled(true);
 
 void reset_visual_interruption_state() {
   std::lock_guard<std::mutex> lck(visual_interruption_mtx);
@@ -1547,6 +1550,12 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setAppPriv
   __android_log_print(ANDROID_LOG_INFO, TAG, "export app private folder: %s\n", app_private_folder.c_str());
 }
 
+extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setDebugLoggingEnabledJNI(
+    JNIEnv *env, jobject instance, jboolean enabled) {
+  // 配置在下一次开始录制时生效，避免录制过程中切换导致多个不完整日志文件。
+  debug_logging_enabled.store(enabled == JNI_TRUE);
+}
+
 extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setRecordStateJNI(JNIEnv *env, jobject instance, jboolean stateAddr) {
   is_recording = (bool)stateAddr;
   if (is_recording) {
@@ -1587,31 +1596,33 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setRecordS
     pose_ext_csv.open(save_folder + pose_csv_name);
     pose_ext_csv << "timestamp,p_x,p_y,p_z,q_x,q_y,q_z,q_w" << std::endl;
 
-    std::string trajectory_debug_csv_name = s + "trajectory_debug.csv";
-    trajectory_debug_csv.open(save_folder + trajectory_debug_csv_name);
-    trajectory_debug_csv << "timestamp,trajectory_size,p_x,p_y,p_z,q_x,q_y,q_z,q_w,dt,step_m,speed_mps,rot_rad,feature_count,zupt_active,"
-                            "forward_projection,turn_guard_active,accepted,reject_reason,anomaly,session_trajectory_size,"
-                            "distance_to_trajectory_end_m,shifting_mileage_m,turning_in_place,turn_protect_active,"
-                            "strong_turn_protect_active,resume_waiting_stable,resume_stable_count,consistent_drift_count,imu_pair_delta_s"
-                            ",update_feature_count,feature_use_ratio,auto_recovery_active,auto_recovery_age_s,soft_recovery_count,"
-                            "auto_recovery_update_frames,auto_recovery_update_features,update_grid_coverage,update_max_grid_ratio,"
-                            "ransac_candidate_count,ransac_inlier_ratio,dynamic_visual_inconsistent,ransac_bad_frames,ransac_good_frames,"
-                            "raw_p_z,vertical_error_m,persistent_severe_reject_count,estimated_camimu_dt_s,estimated_fx,estimated_fy"
-                         << std::endl;
-    std::string camera_quality_csv_name = s + "camera_quality_debug.csv";
-    camera_quality_debug_csv.open(save_folder + camera_quality_csv_name);
-    camera_quality_debug_csv
-        << "timestamp,image_mean,image_stddev,dark_pixel_ratio,blur_score,blocked,imu_accel_norm,imu_gyro_norm,"
-           "imu_accel_stddev,imu_gyro_mean,imu_static,frame_delta_s,camera_queue_size,imu_pair_delta_s,"
-           "visual_interruption_active,recovery_detected,interruption_had_motion,vio_time_offset_s,"
-           "unusable_texture,motion_blurred,frame_filtered,camera_processing_age_s,camera_imu_lead_s,"
-           "camera_queue_after_pop"
-        << std::endl;
-    reset_trajectory_debug_state();
-    {
-      std::lock_guard<std::mutex> traj_lck(trajectory_mtx);
-      // 继续后的记录允许沿用既有轨迹；单独记录本次起始点数，分析时不再受旧数据干扰。
-      trajectory_debug_session_start_size = trajectory_history.size();
+    if (debug_logging_enabled.load()) {
+      std::string trajectory_debug_csv_name = s + "trajectory_debug.csv";
+      trajectory_debug_csv.open(save_folder + trajectory_debug_csv_name);
+      trajectory_debug_csv << "timestamp,trajectory_size,p_x,p_y,p_z,q_x,q_y,q_z,q_w,dt,step_m,speed_mps,rot_rad,feature_count,zupt_active,"
+                              "forward_projection,turn_guard_active,accepted,reject_reason,anomaly,session_trajectory_size,"
+                              "distance_to_trajectory_end_m,shifting_mileage_m,turning_in_place,turn_protect_active,"
+                              "strong_turn_protect_active,resume_waiting_stable,resume_stable_count,consistent_drift_count,imu_pair_delta_s"
+                              ",update_feature_count,feature_use_ratio,auto_recovery_active,auto_recovery_age_s,soft_recovery_count,"
+                              "auto_recovery_update_frames,auto_recovery_update_features,update_grid_coverage,update_max_grid_ratio,"
+                              "ransac_candidate_count,ransac_inlier_ratio,dynamic_visual_inconsistent,ransac_bad_frames,ransac_good_frames,"
+                              "raw_p_z,vertical_error_m,persistent_severe_reject_count,estimated_camimu_dt_s,estimated_fx,estimated_fy"
+                           << std::endl;
+      std::string camera_quality_csv_name = s + "camera_quality_debug.csv";
+      camera_quality_debug_csv.open(save_folder + camera_quality_csv_name);
+      camera_quality_debug_csv
+          << "timestamp,image_mean,image_stddev,dark_pixel_ratio,blur_score,blocked,imu_accel_norm,imu_gyro_norm,"
+             "imu_accel_stddev,imu_gyro_mean,imu_static,frame_delta_s,camera_queue_size,imu_pair_delta_s,"
+             "visual_interruption_active,recovery_detected,interruption_had_motion,vio_time_offset_s,"
+             "unusable_texture,motion_blurred,frame_filtered,camera_processing_age_s,camera_imu_lead_s,"
+             "camera_queue_after_pop"
+          << std::endl;
+      reset_trajectory_debug_state();
+      {
+        std::lock_guard<std::mutex> traj_lck(trajectory_mtx);
+        // 继续后的记录允许沿用既有轨迹；单独记录本次起始点数，分析时不再受旧数据干扰。
+        trajectory_debug_session_start_size = trajectory_history.size();
+      }
     }
   } else {
 
@@ -1629,7 +1640,9 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setRecordS
       std::lock_guard<std::mutex> log_lck(camera_quality_debug_csv_mtx);
       camera_quality_debug_csv.close();
     }
-    reset_trajectory_debug_state();
+    if (debug_logging_enabled.load()) {
+      reset_trajectory_debug_state();
+    }
   }
 }
 
@@ -1906,7 +1919,7 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_getDispla
     // Convert RGBA to RGB for display
     cv::Mat *rgbMat = new cv::Mat();
     cv::cvtColor(rawMat, *rgbMat, cv::COLOR_RGBA2GRAY);
-    if (is_running_ov && trajectory_recovery_user_state.load() == 3) {
+    if (status_overlay_enabled.load() && is_running_ov && trajectory_recovery_user_state.load() == 3) {
       // VIO 对象创建前也立即给出 INIT 反馈，避免用户误以为点击开始没有生效。
       cv::putText(*rgbMat, "INIT", cv::Point(24, 48), cv::FONT_HERSHEY_SIMPLEX, 1.2, cv::Scalar(255), 2, cv::LINE_AA);
     }
@@ -1925,14 +1938,14 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_getDispla
 
   // 系统运行时保留 OpenVINS 原生可视化。漂移后重新初始化期间，用户可以直接看到
   // INIT、特征点和初始化参数变化，比只显示一行文字更容易理解当前进度。
-  cv::Mat viz_img = local_sys->get_historical_viz_image();
+  cv::Mat viz_img = local_sys->get_historical_viz_image(status_overlay_enabled.load());
   if (viz_img.empty()) {
     // Fallback to raw camera if no viz image
     if (rawCameraMatAddr != 0) {
       cv::Mat &rawMat = *(cv::Mat *)rawCameraMatAddr;
       cv::Mat *rgbMat = new cv::Mat();
       cv::cvtColor(rawMat, *rgbMat, cv::COLOR_RGBA2GRAY);
-      if (trajectory_recovery_user_state.load() == 3) {
+      if (status_overlay_enabled.load() && trajectory_recovery_user_state.load() == 3) {
         // VIO 已创建但首张可视化图尚未生成时，也不能让 INIT 提示短暂消失。
         cv::putText(*rgbMat, "INIT", cv::Point(24, 48), cv::FONT_HERSHEY_SIMPLEX, 1.2, cv::Scalar(255), 2, cv::LINE_AA);
       }
@@ -1944,7 +1957,7 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_getDispla
   // Clone the viz image and apply overlays
   cv::Mat *displayMat = new cv::Mat(viz_img.clone());
 
-  if (trajectory_recovery_user_state.load() == 3) {
+  if (status_overlay_enabled.load() && trajectory_recovery_user_state.load() == 3) {
     // 无论 VIO 对象和历史可视化图是否已创建，点击开始后都立即展示 INIT。
     cv::putText(*displayMat, "INIT", cv::Point(24, 48), cv::FONT_HERSHEY_SIMPLEX, 1.2, cv::Scalar(255), 2, cv::LINE_AA);
   }
@@ -2249,7 +2262,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_processIma
   if (viz_time == -1 || (time_in_sec - viz_time) > 1.0 / viz_rate) {
     cv::Mat temp_img;
     if (local_sys != nullptr) {
-      temp_img = local_sys->get_historical_viz_image();
+      temp_img = local_sys->get_historical_viz_image(status_overlay_enabled.load());
     }
     if (!temp_img.empty()) {
       viz_image = temp_img.clone();
@@ -2522,6 +2535,46 @@ extern "C" JNIEXPORT jint JNICALL Java_com_openvins_android_VioEngine_getVisualR
     return static_cast<jint>(trajectory_state);
   }
   return static_cast<jint>(visual_recovery_user_state.load());
+}
+
+extern "C" JNIEXPORT jint JNICALL Java_com_openvins_android_VioEngine_getTrackingStateJNI(JNIEnv *env, jobject instance) {
+  // 状态优先级从“需要用户处理”到“正常运行”，宿主项目可据此稳定驱动 UI。
+  if (!is_running_ov) {
+    return 0; // STOPPED
+  }
+  {
+    std::lock_guard<std::mutex> lck(trajectory_mtx);
+    if (trajectory_data_paused) {
+      return 6; // PAUSED
+    }
+  }
+  const int trajectory_state = trajectory_recovery_user_state.load();
+  if (trajectory_state == 3) {
+    return 1; // INITIALIZING
+  }
+  if (trajectory_state == 2) {
+    return 5; // ALIGNING
+  }
+  if (visual_recovery_user_state.load() != 0) {
+    return 4; // CAMERA_UNAVAILABLE
+  }
+
+  std::shared_ptr<ov_msckf::VioManager> local_sys;
+  {
+    std::lock_guard<std::mutex> sys_lck(sys_mtx);
+    local_sys = sys;
+  }
+  // 与画面中的 init/zvupt 使用同一个初始化标志，避免画面已显示 zvupt，
+  // 宿主 UI 仍停留在“正在初始化”。
+  if (local_sys == nullptr || !local_sys->vio_initialized()) {
+    return 1; // INITIALIZING
+  }
+  return local_sys->last_update_used_zupt() ? 3 : 2; // STATIONARY / TRACKING
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setStatusOverlayEnabledJNI(
+    JNIEnv *env, jobject instance, jboolean enabled) {
+  status_overlay_enabled.store(enabled == JNI_TRUE);
 }
 
 extern "C" JNIEXPORT jint JNICALL Java_com_openvins_android_VioEngine_getTrajectoryPauseReasonJNI(JNIEnv *env, jobject instance) {

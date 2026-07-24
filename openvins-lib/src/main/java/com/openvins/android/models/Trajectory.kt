@@ -10,7 +10,8 @@ data class Result(
     val impact: Double = 0.0,
     val outerImpact: Double = 0.0,
     val absPoseErrRotFro: Double = 0.0,
-    val pointDistance: Double = 0.0
+    val pointDistance: Double = 0.0,
+    val isSameSide: Boolean = false,
 )
 
 data class Pose(val translation: Vec3d, val quaternion: QuatD, val timestamp: Long = 0) {

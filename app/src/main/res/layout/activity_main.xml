@@ -10,14 +10,6 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <com.openvins.android.Trajectory3DView
-        android:id="@+id/trajectory_view"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:layout_alignParentStart="true"
-        android:layout_alignParentTop="true"
-        android:background="@android:color/transparent" />
-
     <com.google.android.material.floatingactionbutton.FloatingActionButton
         android:id="@+id/open_folder"
         android:layout_width="wrap_content"
@@ -61,16 +53,7 @@
         android:scaleType="center"
         android:src="@android:drawable/ic_menu_camera"
         android:tint="@color/black" />
-    <!--    轨迹按钮-->
-    <com.google.android.material.floatingactionbutton.FloatingActionButton
-        android:id="@+id/toggle_trajectory"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginLeft="10dp"
-        android:layout_marginTop="300dp"
-        android:scaleType="center"
-        android:src="@android:drawable/ic_dialog_map"
-        android:tint="@color/black" />
+
 
     <!--    点位展示-->
     <Button
@@ -83,6 +66,19 @@
         android:layout_marginLeft="10dp"
         android:scaleType="center"
         android:src="@android:drawable/star_big_off"
+        android:tint="@color/black" />
+
+    <!--    轨迹按钮-->
+    <Button
+        android:id="@+id/toggle_trajectory"
+        android:text="轨迹图片"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_below="@id/toggle_check"
+        android:layout_alignParentRight="true"
+        android:layout_marginLeft="10dp"
+        android:scaleType="center"
+        android:src="@android:drawable/ic_dialog_map"
         android:tint="@color/black" />
 
     <TextView

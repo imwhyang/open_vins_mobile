@@ -29,16 +29,19 @@ the main insurance app shooting page.
 1. Request camera permission in the main app.
 2. Add `Camera2ResView` to the shooting page. Add `Trajectory3DView` only when
    an on-screen route preview is needed.
-3. Create `OpenVinsSdk`, bind the views, call `initialize()`, then call
+3. Create `OpenVinsSdk`, bind the views, call `initialize(OpenVinsStorageConfig)`, then call
    `beginInsuranceSession(policyId, barnId)`.
 4. Call `start()` when the user enters the shooting page.
-5. At each pen checkpoint, call `capturePenCheck(PenCheckRequest(penId, count))`.
-6. Use `PenCaptureRecord.revisitResult`:
+5. Call `startEvidenceRecording()` to record MP4 and `pose0.csv` together.
+6. At each pen checkpoint, call `capturePen(PenCheckRequest(...))`. The callback
+   returns the photo, current Pose and duplicate-check result as one record.
+7. Use `PenCaptureRecord.revisitResult`:
    - `isRetrieve`: current checkpoint is close to a previously captured pen.
    - `isDuplicated`: recent route segment overlaps previous route.
    - `isMovingFast`: operator movement is too unstable for reliable capture.
-7. Upload `exportSessionJson()` with the app's photo/video evidence.
-8. Call `stop()` when leaving the page and `finishInsuranceSession()` when the
+8. Call `stopEvidenceRecording()` and upload its video/Pose file pair.
+9. Upload `exportSessionJson()` with the app's photo/video evidence.
+10. Call `stop()` when leaving the page and `finishInsuranceSession()` when the
    barn capture is complete.
 
 ## Minimal Kotlin Example
@@ -63,16 +66,16 @@ sdk.beginInsuranceSession(policyId = "P20260630001", barnId = "BARN-A")
 sdk.notifyCameraPermissionGranted()
 sdk.start()
 
-val record = sdk.capturePenCheck(
+sdk.capturePen(
     PenCheckRequest(
         penId = "PEN-12",
         expectedPigCount = 36,
         operatorRemark = "left aisle"
     )
-)
-
-if (record?.revisitResult?.isRevisit == true) {
-    // Block or warn before allowing duplicate underwriting evidence.
+) { result ->
+    if (result?.record?.revisitResult?.isRevisit == true) {
+        // Block or warn before allowing duplicate underwriting evidence.
+    }
 }
 ```
 

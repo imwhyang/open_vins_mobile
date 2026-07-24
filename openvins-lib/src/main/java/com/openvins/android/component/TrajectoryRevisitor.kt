@@ -11,6 +11,7 @@ import com.openvins.android.models.SO3
 import com.openvins.android.models.Trajectory
 import glm_.vec3.Vec3d
 import kotlin.math.max
+import kotlin.math.sqrt
 
 class TrajectoryRevisitor {
     private var _config: Map<String, Any> = emptyMap()
@@ -19,6 +20,7 @@ class TrajectoryRevisitor {
     private var _impactThreshold: Double = 0.35
     private var _absPoseErrRotFro: Double = 0.2
     private var _pointDistance: Double = 0.5
+    private var _sameSideCosThreshold: Double = 0.0
     private var _shiftingMileage: Double = 1.0
 
     private var _smoothingSigma: Double = 1.0
@@ -36,6 +38,7 @@ class TrajectoryRevisitor {
         _impactThreshold = doubleConfig("impactThreshold", 0.5)
         _absPoseErrRotFro = doubleConfig("absPoseErrRotFro", 0.2)
         _pointDistance = doubleConfig("pointDistance", 0.5)
+        _sameSideCosThreshold = doubleConfig("sameSideCosThreshold", 0.0)
         _shiftingMileage = doubleConfig("shiftingMileage", 1.0)
 
         _smoothingSigma = doubleConfig("smoothingSigma", 1.0)
@@ -135,28 +138,59 @@ class TrajectoryRevisitor {
             return Result()
         }
         val invQueryPose = SO3.create(queryQuaternion).inverse()
-        val tmp = doubleArrayOf(1000.0, 0.0, 0.0)
+        val queryDirection = horizontalCameraDirection(queryQuaternion)
+        var bestRotationError = 0.0
+        var bestPointDistance = 1000.0
+        var foundSameSide = false
         for (i in candidateTranslations.indices) {
             val candidatePose = SO3.create(candidateQuaternions[i])
             val resultQuat = (invQueryPose * candidatePose).toQuat()
             val absPoseErrRotFro = Vec3d(resultQuat.x, resultQuat.y, resultQuat.z).length()
             val pointDistance =
                 Utils.distancePointToPoint(candidateTranslations[i], queryTranslation)
-            if (absPoseErrRotFro < _absPoseErrRotFro && pointDistance < _pointDistance) {
-                return Result(
-                    isRetrieve = true,
-                    absPoseErrRotFro = absPoseErrRotFro,
-                    pointDistance = pointDistance
-                )
+
+            // 猪圈位于过道两侧：站位相近但镜头朝向相反时，应视为拍摄不同侧猪圈。
+            val candidateDirection = horizontalCameraDirection(candidateQuaternions[i])
+            val sameSide = horizontalDot(queryDirection, candidateDirection) > _sameSideCosThreshold
+            if (!sameSide) {
+                continue
             }
-            val ratio = _absPoseErrRotFro * pointDistance + _pointDistance * absPoseErrRotFro
-            if (ratio < tmp[0]) {
-                tmp[0] = ratio
-                tmp[1] = absPoseErrRotFro
-                tmp[2] = pointDistance
+
+            // 同侧候选中选择距离最近的一次，避免历史数组顺序影响最终判断。
+            foundSameSide = true
+            if (pointDistance < bestPointDistance) {
+                bestRotationError = absPoseErrRotFro
+                bestPointDistance = pointDistance
             }
         }
-        return Result(absPoseErrRotFro = tmp[1], pointDistance = tmp[2])
+        return Result(
+            isRetrieve = foundSameSide && bestPointDistance < _pointDistance,
+            absPoseErrRotFro = bestRotationError,
+            pointDistance = bestPointDistance,
+            isSameSide = foundSameSide,
+        )
+    }
+
+    /**
+     * 使用相机局部 X 轴作为拍摄方向，并投影到水平面。
+     * 与轨迹外轮廓计算保持同一坐标约定，忽略手持俯仰和横滚带来的影响。
+     */
+    private fun horizontalCameraDirection(quaternion: DoubleArray): DoubleArray {
+        val direction = SO3.create(quaternion).matrix * Vec3d(1.0, 0.0, 0.0)
+        val norm = sqrt(direction.x * direction.x + direction.y * direction.y)
+        if (norm < 1e-6) {
+            return doubleArrayOf(0.0, 0.0)
+        }
+        return doubleArrayOf(direction.x / norm, direction.y / norm)
+    }
+
+    private fun horizontalDot(first: DoubleArray, second: DoubleArray): Double {
+        if ((first[0] == 0.0 && first[1] == 0.0) ||
+            (second[0] == 0.0 && second[1] == 0.0)
+        ) {
+            return -1.0
+        }
+        return first[0] * second[0] + first[1] * second[1]
     }
 
     fun captureRevisited(
@@ -198,14 +232,17 @@ class TrajectoryRevisitor {
             queryQuaternion
         )
         val result1 = searchRevisitTrajectory(translations, quaternions, translation, quaternion)
+        // 路径重合只能作为同侧拍摄的辅助条件，避免站在过道同一位置转向另一侧时误报。
+        val duplicatedOnSameSide = result0.isSameSide && result1.isDuplicated
         val result = Result(
-            result0.isRetrieve || result1.isDuplicated,
+            result0.isRetrieve || duplicatedOnSameSide,
             isRetrieve = result0.isRetrieve,
-            isDuplicated = result1.isDuplicated,
+            isDuplicated = duplicatedOnSameSide,
             impact = result1.impact,
             outerImpact = result1.outerImpact,
             absPoseErrRotFro = result0.absPoseErrRotFro,
             pointDistance = result0.pointDistance,
+            isSameSide = result0.isSameSide,
         )
         return result
     }

@@ -386,7 +386,7 @@ void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message)
   PRINT_ALL(CYAN "[RETRI-TIME]: %.4f seconds total\n" RESET, (retri_rT3 - retri_rT1).total_microseconds() * 1e-6);
 }
 
-cv::Mat VioManager::get_historical_viz_image() {
+cv::Mat VioManager::get_historical_viz_image(bool show_status_overlay) {
 
   // Return if not ready yet
   if (state == nullptr || trackFEATS == nullptr)
@@ -399,8 +399,13 @@ cv::Mat VioManager::get_historical_viz_image() {
   }
 
   // Text we will overlay if needed
-  std::string overlay = (did_zupt_update) ? "zvupt" : "";
-  overlay = (!is_initialized_vio) ? "init" : overlay;
+  // 状态文字仅用于调试。正式 SDK 接入应通过结构化状态回调展示交互，
+  // 避免在宿主项目的相机画面上写死 init/zvupt。
+  std::string overlay;
+  if (show_status_overlay) {
+    overlay = (did_zupt_update) ? "zvupt" : "";
+    overlay = (!is_initialized_vio) ? "init" : overlay;
+  }
 
   // Get the current active tracks
   cv::Mat img_history;
