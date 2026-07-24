@@ -139,8 +139,10 @@ android {
         }
     }
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_6
-        targetCompatibility JavaVersion.VERSION_1_6
+        // JitPack 使用 JDK 17，已不支持 Java 6 的 source/target。
+        // OpenCV 4.5.1 源码可直接按 Java 8 编译，无需额外下载 JDK 8 Toolchain。
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
     }
 
     sourceSets {
@@ -161,9 +163,4 @@ android {
 }
 
 dependencies {
-}
-java {
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(8)
-    }
 }
