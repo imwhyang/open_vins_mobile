@@ -315,3 +315,85 @@ SDK 首次初始化会将以下配置复制到应用私有目录：
 ```text
 app/src/main/java/com/openvins/android/MainActivity.kt
 ```
+
+## 12. Activity 控制 Fragment 的完整示例
+
+项目提供以下示例：
+
+```text
+app/src/main/java/com/openvins/android/AutoCaptureFragment.kt
+app/src/main/java/com/openvins/android/FragmentCaptureActivity.kt
+app/src/main/res/layout/fragment_auto_capture.xml
+app/src/main/res/layout/activity_fragment_capture.xml
+```
+
+Fragment 创建时自动使用当前毫秒时间戳作为 `taskId`，不需要传入
+`policyId`、`barnId` 或 `sessionId`：
+
+```kotlin
+val fragment = AutoCaptureFragment.newInstance()
+```
+
+Activity 调用 Fragment 拍摄：
+
+```kotlin
+captureButton.setOnClickListener {
+    fragment.capture()
+}
+```
+
+Activity 调用 Fragment 完成任务：
+
+```kotlin
+finishButton.setOnClickListener {
+    fragment.finishTask()
+}
+```
+
+Activity 实现回调接口：
+
+```kotlin
+class CaptureActivity : AppCompatActivity(), AutoCaptureFragmentListener {
+
+    override fun onCaptureCompleted(result: FragmentCaptureResult) {
+        val photoPath = result.photoPath
+        val isDuplicate = result.isDuplicate
+    }
+
+    override fun onTaskCompleted(result: FragmentTaskResult) {
+        val videoPath = result.videoPath
+        val posePath = result.posePath
+        val trajectoryImagePath = result.trajectoryImagePath
+    }
+
+    override fun onCaptureError(message: String) {
+        // 展示错误提示
+    }
+}
+```
+
+`FragmentCaptureActivity` 还演示了使用 `setResult()` 将最终结果返回给启动页面：
+
+```kotlin
+val data = Intent().apply {
+    putExtra(FragmentCaptureActivity.EXTRA_VIDEO_PATH, result.videoPath)
+    putExtra(FragmentCaptureActivity.EXTRA_POSE_PATH, result.posePath)
+    putExtra(
+        FragmentCaptureActivity.EXTRA_TRAJECTORY_IMAGE_PATH,
+        result.trajectoryImagePath
+    )
+}
+setResult(Activity.RESULT_OK, data)
+finish()
+```
+
+自动执行流程：
+
+1. Fragment 创建时自动初始化 SDK、存储目录、查重规则和业务会话。
+2. 相机权限通过后自动启动相机、IMU 和 VIO。
+3. 定位进入可靠状态后自动开始 MP4 与 `pose0.csv` 录制。
+4. Activity 调用 `capture()` 完成照片、Pose 和同侧查重。
+5. Activity 调用 `finishTask()` 停止录制和定位。
+6. Fragment 自动生成 `trajectory/final.jpg` 并回调所有文件路径。
+
+页面中没有 `Trajectory3DView`，不会向用户展示实时轨迹。

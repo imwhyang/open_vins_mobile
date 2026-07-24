@@ -115,7 +115,8 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
     }
 
     private fun checkState() {
-        if (mEnabled && mCameraPermissionGranted && holder.surface != null && visibility == VISIBLE) {
+        val surfaceReady = holder.surface?.isValid == true && width > 0 && height > 0
+        if (mEnabled && mCameraPermissionGranted && surfaceReady && visibility == VISIBLE) {
             if (mCameraDevice == null) {
                 connectCamera()
             }
