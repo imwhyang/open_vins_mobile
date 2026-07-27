@@ -152,13 +152,21 @@ class AutoCaptureFragment : Fragment(), OpenVinsSdkListener {
 
     override fun onPause() {
         isFragmentResumed = false
-        // 页面临时离开时只释放硬件资源；正式结果由 finishTask() 回调。
-        if (!isTaskFinished && isTrackingStarted) {
+        // 跳转到同一应用的其他页面时保持相机、IMU、轨迹、视频和 Pose 连续运行。
+        // 采集资源只在完成任务或当前 Fragment 被真正移除时释放。
+        super.onPause()
+    }
+
+    override fun onDestroyView() {
+        val shouldReleaseCollection = !isTaskFinished && (isRemoving || activity?.isFinishing == true)
+        if (shouldReleaseCollection && ::sdk.isInitialized && isTrackingStarted) {
             sdk.stopEvidenceRecording()
             sdk.stop()
             isTrackingStarted = false
         }
-        super.onPause()
+        pauseDialog?.dismiss()
+        pauseDialog = null
+        super.onDestroyView()
     }
 
     private fun startAutomaticCollection() {
@@ -257,7 +265,7 @@ class AutoCaptureFragment : Fragment(), OpenVinsSdkListener {
         }
 
         // 首次定位可靠后自动开始同步记录视频和 Pose。
-        if (status.canUsePose && isFragmentResumed && !isTaskFinished && !sdk.isEvidenceRecording()) {
+        if (status.canUsePose && !isTaskFinished && !sdk.isEvidenceRecording()) {
             sdk.startEvidenceRecording(recordingId = taskId)
         }
     }

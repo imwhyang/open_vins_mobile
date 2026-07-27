@@ -116,7 +116,10 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
 
     private fun checkState() {
         val surfaceReady = holder.surface?.isValid == true && width > 0 && height > 0
-        if (mEnabled && mCameraPermissionGranted && surfaceReady && visibility == VISIBLE) {
+        // 相机帧实际输出到 ImageReader，预览 Surface 暂时销毁时不必关闭相机。
+        // 这样同一应用跳转到其他页面后，VIO、视频和 Pose 仍可连续记录。
+        val canKeepRunning = mEnabled && mCameraPermissionGranted
+        if (canKeepRunning && (mCameraDevice != null || surfaceReady)) {
             if (mCameraDevice == null) {
                 connectCamera()
             }
@@ -599,6 +602,10 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
     }
     
     private fun drawFrame() {
+        // 页面不可见或 Surface 尚未恢复时只跳过预览绘制，相机帧仍继续参与定位和录像。
+        if (!holder.surface.isValid || visibility != VISIBLE) {
+            return
+        }
         val bitmap = synchronized(mDisplayLock) {
             mDisplayBitmap
         }
