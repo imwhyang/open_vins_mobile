@@ -164,6 +164,14 @@ class VioEngine {
         setStatusOverlayEnabledJNI(enabled)
     }
 
+    /**
+     * 控制相机预览中的原生调试信息。
+     * 关闭后不显示特征点、CAM、频率、录制状态和位姿参数，但不影响定位计算。
+     */
+    fun setDebugVisualizationEnabled(enabled: Boolean) {
+        setDebugVisualizationEnabledJNI(enabled)
+    }
+
     fun getTrajectoryPauseReason(): Int {
         return getTrajectoryPauseReasonJNI()
     }
@@ -223,6 +231,7 @@ class VioEngine {
     private external fun getVisualRecoveryStateJNI(): Int
     private external fun getTrackingStateJNI(): Int
     private external fun setStatusOverlayEnabledJNI(enabled: Boolean)
+    private external fun setDebugVisualizationEnabledJNI(enabled: Boolean)
     private external fun getTrajectoryPauseReasonJNI(): Int
     private external fun resumeTrajectoryJNI()
     private external fun processYUVToRGBAJNI(

@@ -170,6 +170,8 @@ std::atomic<bool> camera_filter_recovery_pending(false);
 std::atomic<bool> camera_frame_filtered_for_display(false);
 // 示例和调试默认保留 OpenVINS 原生状态文字，JitPack 宿主可关闭后使用状态回调。
 std::atomic<bool> status_overlay_enabled(true);
+// 仅控制相机预览中的特征点、CAM、频率、录制状态和位姿参数，不影响 VIO 计算。
+std::atomic<bool> debug_visualization_enabled(false);
 
 void reset_visual_interruption_state() {
   std::lock_guard<std::mutex> lck(visual_interruption_mtx);
@@ -1903,6 +1905,14 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_processYU
 // Get display image - returns raw camera if not running, or viz image with overlays if running
 extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_getDisplayImageJNI(JNIEnv *env, jobject clazz,
                                                                                           jlong rawCameraMatAddr) {
+  // 正式模式直接展示干净的实时画面，特征跟踪仍在后台正常执行。
+  if (!debug_visualization_enabled.load() && rawCameraMatAddr != 0) {
+    cv::Mat &rawMat = *(cv::Mat *)rawCameraMatAddr;
+    cv::Mat *grayMat = new cv::Mat();
+    cv::cvtColor(rawMat, *grayMat, cv::COLOR_RGBA2GRAY);
+    return reinterpret_cast<jlong>(grayMat);
+  }
+
   std::shared_ptr<ov_msckf::VioManager> local_sys;
   {
     std::lock_guard<std::mutex> sys_lck(sys_mtx);
@@ -2575,6 +2585,11 @@ extern "C" JNIEXPORT jint JNICALL Java_com_openvins_android_VioEngine_getTrackin
 extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setStatusOverlayEnabledJNI(
     JNIEnv *env, jobject instance, jboolean enabled) {
   status_overlay_enabled.store(enabled == JNI_TRUE);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_openvins_android_VioEngine_setDebugVisualizationEnabledJNI(
+    JNIEnv *env, jobject instance, jboolean enabled) {
+  debug_visualization_enabled.store(enabled == JNI_TRUE);
 }
 
 extern "C" JNIEXPORT jint JNICALL Java_com_openvins_android_VioEngine_getTrajectoryPauseReasonJNI(JNIEnv *env, jobject instance) {

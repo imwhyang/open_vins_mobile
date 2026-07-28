@@ -2,6 +2,7 @@ package com.openvins.app
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.content.pm.ApplicationInfo
 import android.os.Bundle
 import android.os.Environment
 import android.text.InputType
@@ -67,6 +68,10 @@ class MainActivity : AppCompatActivity(), OpenVinsSdkListener {
             bindCameraView(cameraView)
             // 示例页保留 init/zvupt；正式项目可关闭并完全使用状态回调。
             setStatusOverlayEnabled(true)
+            // 原生特征点和定位参数仅用于 Debug 调试，Release 包不展示。
+            setDebugVisualizationEnabled(
+                applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+            )
         }
         configureDefaultStorage()
         configureRevisitRules()

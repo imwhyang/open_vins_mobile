@@ -404,6 +404,16 @@ class OpenVinsSdk(
         engine.setStatusOverlayEnabled(enabled)
     }
 
+    /**
+     * 控制相机预览中的 OpenVINS 原生调试可视化。
+     *
+     * 开启后显示特征点、CAM、帧率、录制状态和位姿参数；关闭后显示干净画面。
+     * 该设置仅影响预览，不影响定位、轨迹、视频和 Pose 数据。
+     */
+    fun setDebugVisualizationEnabled(enabled: Boolean) {
+        engine.setDebugVisualizationEnabled(enabled)
+    }
+
     /** 配置下次录制是否额外生成诊断日志；正式环境默认只生成 pose0.csv。 */
     fun setDebugLoggingEnabled(enabled: Boolean) {
         engine.setDebugLoggingEnabled(enabled)
@@ -787,7 +797,7 @@ class OpenVinsSdk(
     ) {
         val snapshot = getTrajectorySnapshot() ?: lastTrajectorySnapshot
         if (snapshot == null || snapshot.positions.isEmpty()) {
-            listener?.onError("当前没有可导出的轨迹数据。")
+            listener?.onError("当前没有可导出的路径数据。")
             callback(null)
             return
         }
@@ -795,7 +805,7 @@ class OpenVinsSdk(
             val result = TrajectoryImageExporter.export(snapshot, file, config)
             mainHandler.post {
                 if (result == null) {
-                    listener?.onError("轨迹图片导出失败。")
+                    listener?.onError("路径图片导出失败。")
                 }
                 callback(result)
             }

@@ -2,6 +2,7 @@ package com.openvins.app
 
 import android.Manifest
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.Environment
@@ -133,6 +134,10 @@ class AutoCaptureFragment : Fragment(), OpenVinsSdkListener {
                 )
             )
             setStatusOverlayEnabled(false)
+            // 调试包展示原生定位信息，正式包只展示干净的相机画面。
+            setDebugVisualizationEnabled(
+                requireContext().applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+            )
             // 没有外部业务编号时统一使用任务时间戳，便于关联本次所有文件。
             beginInsuranceSession(
                 policyId = taskId,
