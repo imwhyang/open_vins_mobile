@@ -4,6 +4,9 @@ plugins {
     id 'maven-publish'
 }
 
+// 与 GitHub/JitPack 发布标签对应；Android 元信息不带 v，Maven 坐标沿用 v 前缀。
+def openVinsReleaseVersion = '1.0.29'
+
 android {
     namespace "com.openvins.android"
     compileSdk 30
@@ -13,7 +16,7 @@ android {
         minSdkVersion 21
         targetSdkVersion 30
         versionCode 1
-        versionName "1.0.11"
+        versionName openVinsReleaseVersion
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild {
@@ -55,6 +58,9 @@ android {
 }
 
 dependencies {
+    // 真机验证外部相机的 I420/NV21 转换，避免仅编译通过却在首帧出现 native 异常。
+    androidTestImplementation 'androidx.test:runner:1.4.0'
+    androidTestImplementation 'androidx.test.ext:junit:1.1.3'
     implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
     implementation 'androidx.core:core-ktx:1.2.0'
     implementation 'androidx.appcompat:appcompat:1.1.0'
@@ -71,9 +77,10 @@ afterEvaluate {
         publications {
             release(MavenPublication) {
                 from components.release
-                groupId = 'com.github.openvins'
-                artifactId = 'openvins-lib'
-                version = '1.0.10'
+                // 本地发布与 JitPack 使用同一正式坐标，避免消费者依赖临时 USB 包。
+                groupId = 'com.github.imwhyang'
+                artifactId = 'open_vins_mobile'
+                version = "v${openVinsReleaseVersion}"
 
                 // 移除本地子模块依赖，防止消费方编译失败
                 pom.withXml {

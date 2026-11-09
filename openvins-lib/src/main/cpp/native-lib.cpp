@@ -1886,8 +1886,16 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_openvins_android_VioEngine_processYU
     // Combine into I420 format: Y + U + V
     cv::Mat yuvMat(height + chromaHeight, width, CV_8UC1);
     yMat.copyTo(yuvMat(cv::Rect(0, 0, width, height)));
-    uMat.copyTo(yuvMat(cv::Rect(0, height, chromaWidth, chromaHeight)));
-    vMat.copyTo(yuvMat(cv::Rect(0, height + chromaHeight, chromaWidth, chromaHeight)));
+    // I420 在内存中连续排列 Y、U、V，色度平面的行宽只有 width/2。
+    // 不能把 U、V 当成 width 宽图像下方的两个矩形，V 的旧 Rect 会越过 yuvMat 底边。
+    const size_t ySize = static_cast<size_t>(width) * height;
+    const size_t chromaSize = static_cast<size_t>(chromaWidth) * chromaHeight;
+    for (int row = 0; row < chromaHeight; ++row) {
+      memcpy(yuvMat.data + ySize + static_cast<size_t>(row) * chromaWidth,
+             uMat.ptr(row), chromaWidth);
+      memcpy(yuvMat.data + ySize + chromaSize + static_cast<size_t>(row) * chromaWidth,
+             vMat.ptr(row), chromaWidth);
+    }
 
     // Convert to RGBA
     cv::cvtColor(yuvMat, *outputMat, cv::COLOR_YUV2RGBA_I420, 4);

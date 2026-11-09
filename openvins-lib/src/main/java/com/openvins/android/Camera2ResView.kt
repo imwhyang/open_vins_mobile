@@ -53,12 +53,14 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
     private var mCaptureSession: CameraCaptureSession? = null
     private var mPreviewRequestBuilder: CaptureRequest.Builder? = null
     private var mCameraID: String? = null
+    @Volatile
     private var mPreviewSize: Size = Size(-1, -1)
     private var mBackgroundThread: HandlerThread? = null
     private var mBackgroundHandler: Handler? = null
     private val mPreviewFormat = ImageFormat.YUV_420_888
 
     private var mFrameListener: CameraFrameListener? = null
+    @Volatile
     private var mEnabled = false
     // 相机是否活跃，退出时先置 false 让 onImageAvailable 丢弃后续帧
     @Volatile
@@ -110,11 +112,199 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
     }
 
     fun disableView() {
-        mEnabled = false
+        // 等待当前外部帧处理完毕后再结束，防止退出时继续写入录像或截图。
+        synchronized(externalFrameLock) {
+            mEnabled = false
+        }
         checkState()
     }
 
+    /** 外部输入在启动前选定；默认关闭，兼容原有手机相机调用。 */
+    @Volatile
+    private var externalInputEnabled = false
+    @Volatile
+    private var externalHasFrame = false
+    private val externalFrameLock = Object()
+
+    /** 在 SDK.start() 前启用 USB 等外部相机输入，避免同时打开手机摄像头。 */
+    fun setExternalInputEnabled(enabled: Boolean) {
+        check(!mEnabled && !mIsRecording) { "请在相机启动前选择输入源。" }
+        externalInputEnabled = enabled
+    }
+
+    /**
+     * 同步消费一帧 NV21，调用返回后宿主可复用缓冲区；请在相机工作线程调用。
+     * 时间戳必须与手机 IMU 同为开机纳秒时钟，例如 SystemClock.elapsedRealtimeNanos()。
+     * 外部镜头需与手机固定连接，并使用对应相机/IMU 标定配置。
+     */
+    fun submitExternalNv21Frame(data: ByteArray, width: Int, height: Int, timestampNs: Long) {
+        synchronized(externalFrameLock) {
+            if (!externalInputEnabled || !mEnabled || !mCameraPermissionGranted) return
+            if (width <= 0 || height <= 0 || width % 2 != 0 || height % 2 != 0 || timestampNs <= 0) return
+            val frameSize = width.toLong() * height
+            if (frameSize * 3 / 2 > data.size) return
+            // 录制期间保持编码尺寸固定，防止设备异常变更分辨率导致坏帧。
+            if (mIsRecording && (mPreviewSize.width != width || mPreviewSize.height != height)) return
+            mPreviewSize = Size(width, height)
+            externalHasFrame = true
+            lastFrameTimestampSec = timestampNs * 1e-9
+            val y = data.copyOfRange(0, frameSize.toInt())
+            // 将 NV21 的 VU 拆为独立平面，供现有 JPEG、VIO 和 NV12 编码共同使用。
+            // 不把偏移后的 U 数组冒充 NV12，避免录像出现色偏。
+            val u = ByteArray(frameSize.toInt() / 4)
+            val v = ByteArray(u.size)
+            for (index in u.indices) {
+                v[index] = data[frameSize.toInt() + index * 2]
+                u[index] = data[frameSize.toInt() + index * 2 + 1]
+            }
+            try {
+                processYuvFrame(y, u, v, width, height, width, width / 2, width / 2, 1, timestampNs)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error processing external camera frame", e)
+            }
+        }
+    }
+
+    /** USB 断开时结束待保存截图；保留编码器，由 SDK 完成任务时统一关闭录像。 */
+    fun notifyExternalCameraDisconnected() {
+        synchronized(externalFrameLock) {
+            externalHasFrame = false
+            if (mPendingCapturePath != null) {
+                mPendingCapturePath = null
+                notifyCaptureResult(null)
+            }
+        }
+    }
+
+    /** 手机与外部相机共用截图、VIO、预览和编码逻辑，避免结果来自不同镜头。 */
+    private fun processYuvFrame(
+        yBytes: ByteArray, uBytes: ByteArray?, vBytes: ByteArray?,
+        imgWidth: Int, imgHeight: Int, yStride: Int, uStride: Int, vStride: Int,
+        uPixelStride: Int, frameTimestampNs: Long,
+    ) {
+        // ---- 原始帧截图：在 YUV 提取之后、VIO 处理之前检查挂起的捕获请求 ----
+        val pendingPath = mPendingCapturePath
+        if (pendingPath != null) {
+            mPendingCapturePath = null
+            val quality = mPendingCaptureQuality
+            try {
+                saveRawFrameAsJpeg(yBytes, uBytes, vBytes, imgWidth, imgHeight,
+                    yStride, uStride, vStride, uPixelStride,
+                    pendingPath, quality)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to capture raw frame", e)
+                notifyCaptureResult(null)
+            }
+        }
+
+        // Convert YUV to RGBA in native code - returns Mat address
+        val rgbaMatAddr = engine.processYUVToRGBA(
+            yBytes, uBytes, vBytes,
+            imgWidth, imgHeight,
+            yStride, uStride, vStride,
+            uPixelStride
+        )
+
+        if (rgbaMatAddr == 0L) {
+            // VIO 未初始化时仍录制原始相机帧，不跳过
+            if (mIsRecording) {
+                synchronized(mRecordingLock) {
+                    if (mIsRecording) {
+                        feedFrameToEncoder(
+                            yBytes, uBytes, vBytes,
+                            imgWidth, imgHeight,
+                            yStride, uStride, vStride,
+                            uPixelStride,
+                            frameTimestampNs
+                        )
+                    }
+                }
+            }
+            return
+        }
+
+        try {
+            // Notify listener with Mat address and timestamp (for processing)
+            // processImageJNI will clone the Mat before queuing, so it's safe to delete after
+            mFrameListener?.onFrame(rgbaMatAddr, lastFrameTimestampSec)
+
+            // Get display image (raw camera if not running, or viz with overlays if running)
+            // Note: getDisplayImageJNI creates a new Mat, so we can safely delete rgbaMatAddr after this
+            // USB 模式由原 TextureView 预览，隐藏的 SurfaceView 无需重复转换、绘制画面。
+            // 图像仍已通过 onFrame 参与定位，后面的 JPEG 和视频录制逻辑保持运行。
+            val displayMatAddr = if (externalInputEnabled && visibility != VISIBLE) 0L
+                else engine.getDisplayImage(rgbaMatAddr)
+
+            // Now safe to delete the raw camera Mat since:
+            // 1. processImageJNI has cloned the data it needs before queuing
+            // 2. getDisplayImageJNI has created a new Mat and is done with the original
+            engine.deleteMat(rgbaMatAddr)
+
+            if (displayMatAddr != 0L) {
+                try {
+                    // Use Java Mat wrapper temporarily to access Mat data for bitmap conversion
+                    val displayMat = Mat(displayMatAddr)
+                    synchronized(mDisplayLock) {
+                        val displayWidth = displayMat.width()
+                        val displayHeight = displayMat.height()
+                        if (mDisplayBitmap == null || mDisplayBitmap!!.width != displayWidth || mDisplayBitmap!!.height != displayHeight) {
+                            mDisplayBitmap?.recycle()
+                            mDisplayBitmap = Bitmap.createBitmap(displayWidth, displayHeight, Bitmap.Config.ARGB_8888)
+                        }
+                        // Convert Mat to Bitmap
+                        Utils.matToBitmap(displayMat, mDisplayBitmap!!)
+
+                        // Draw to surface on UI thread
+                        post {
+                            drawFrame()
+                        }
+                    }
+                    // Delete the Mat manually (created with 'new' in C++)
+                    // Set nativeObj to 0 first to prevent Java finalizer from double-deleting
+                    val field = Mat::class.java.getDeclaredField("nativeObj")
+                    field.isAccessible = true
+                    field.setLong(displayMat, 0L)
+                    engine.deleteMat(displayMatAddr)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error displaying frame", e)
+                    // Make sure we still delete the Mat even if there's an error
+                    if (displayMatAddr != 0L) {
+                        engine.deleteMat(displayMatAddr)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error processing frame", e)
+            // Make sure we still delete the Mat even if there's an error
+            if (rgbaMatAddr != 0L) {
+                try {
+                    engine.deleteMat(rgbaMatAddr)
+                } catch (e2: Exception) {
+                    Log.e(TAG, "Error deleting Mat", e2)
+                }
+            }
+        }
+
+        // ---- 录制：在 VIO 处理之后、image.close() 之前，将帧送入编码器 ----
+        if (mIsRecording) {
+            synchronized(mRecordingLock) {
+                if (mIsRecording && yBytes.isNotEmpty()) {
+                    feedFrameToEncoder(
+                        yBytes, uBytes, vBytes,
+                        imgWidth, imgHeight,
+                        yStride, uStride, vStride,
+                        uPixelStride,
+                        frameTimestampNs
+                    )
+                }
+            }
+        }
+
+    }
+
     private fun checkState() {
+        // 外部输入由宿主取帧，Surface 生命周期不再触发手机 Camera2。
+        if (externalInputEnabled) return
         val surfaceReady = holder.surface?.isValid == true && width > 0 && height > 0
         // 相机帧实际输出到 ImageReader，预览 Surface 暂时销毁时不必关闭相机。
         // 这样同一应用跳转到其他页面后，VIO、视频和 Pose 仍可连续记录。
@@ -363,120 +553,8 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
                     bytes
                 } else null
                 
-                // ---- 原始帧截图：在 YUV 提取之后、VIO 处理之前检查挂起的捕获请求 ----
-                val pendingPath = mPendingCapturePath
-                if (pendingPath != null) {
-                    mPendingCapturePath = null
-                    val quality = mPendingCaptureQuality
-                    try {
-                        saveRawFrameAsJpeg(yBytes, uBytes, vBytes, imgWidth, imgHeight,
-                            yStride, uStride, vStride, uPixelStride,
-                            pendingPath, quality)
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Failed to capture raw frame", e)
-                        notifyCaptureResult(null)
-                    }
-                }
-
-                // Convert YUV to RGBA in native code - returns Mat address
-                val rgbaMatAddr = engine.processYUVToRGBA(
-                    yBytes, uBytes, vBytes,
-                    imgWidth, imgHeight,
-                    yStride, uStride, vStride,
-                    uPixelStride
-                )
-                
-                if (rgbaMatAddr == 0L) {
-                    // VIO 未初始化时仍录制原始相机帧，不跳过
-                    if (mIsRecording) {
-                        synchronized(mRecordingLock) {
-                            if (mIsRecording) {
-                                feedFrameToEncoder(
-                                    yBytes, uBytes, vBytes,
-                                    imgWidth, imgHeight,
-                                    yStride, uStride, vStride,
-                                    uPixelStride,
-                                    frameTimestampNs
-                                )
-                            }
-                        }
-                    }
-                    return@setOnImageAvailableListener
-                }
-                
-                try {
-                    // Notify listener with Mat address and timestamp (for processing)
-                    // processImageJNI will clone the Mat before queuing, so it's safe to delete after
-                    mFrameListener?.onFrame(rgbaMatAddr, lastFrameTimestampSec)
-                    
-                    // Get display image (raw camera if not running, or viz with overlays if running)
-                    // Note: getDisplayImageJNI creates a new Mat, so we can safely delete rgbaMatAddr after this
-                    val displayMatAddr = engine.getDisplayImage(rgbaMatAddr)
-                    
-                    // Now safe to delete the raw camera Mat since:
-                    // 1. processImageJNI has cloned the data it needs before queuing
-                    // 2. getDisplayImageJNI has created a new Mat and is done with the original
-                    engine.deleteMat(rgbaMatAddr)
-                    
-                    if (displayMatAddr != 0L) {
-                        try {
-                            // Use Java Mat wrapper temporarily to access Mat data for bitmap conversion
-                            val displayMat = Mat(displayMatAddr)
-                            synchronized(mDisplayLock) {
-                                val displayWidth = displayMat.width()
-                                val displayHeight = displayMat.height()
-                                if (mDisplayBitmap == null || mDisplayBitmap!!.width != displayWidth || mDisplayBitmap!!.height != displayHeight) {
-                                    mDisplayBitmap?.recycle()
-                                    mDisplayBitmap = Bitmap.createBitmap(displayWidth, displayHeight, Bitmap.Config.ARGB_8888)
-                                }
-                                // Convert Mat to Bitmap
-                                Utils.matToBitmap(displayMat, mDisplayBitmap!!)
-                                
-                                // Draw to surface on UI thread
-                                post {
-                                    drawFrame()
-                                }
-                            }
-                            // Delete the Mat manually (created with 'new' in C++)
-                            // Set nativeObj to 0 first to prevent Java finalizer from double-deleting
-                            val field = Mat::class.java.getDeclaredField("nativeObj")
-                            field.isAccessible = true
-                            field.setLong(displayMat, 0L)
-                            engine.deleteMat(displayMatAddr)
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Error displaying frame", e)
-                            // Make sure we still delete the Mat even if there's an error
-                            if (displayMatAddr != 0L) {
-                                engine.deleteMat(displayMatAddr)
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error processing frame", e)
-                    // Make sure we still delete the Mat even if there's an error
-                    if (rgbaMatAddr != 0L) {
-                        try {
-                            engine.deleteMat(rgbaMatAddr)
-                        } catch (e2: Exception) {
-                            Log.e(TAG, "Error deleting Mat", e2)
-                        }
-                    }
-                }
-                
-                // ---- 录制：在 VIO 处理之后、image.close() 之前，将帧送入编码器 ----
-                if (mIsRecording) {
-                    synchronized(mRecordingLock) {
-                        if (mIsRecording && yBytes.isNotEmpty()) {
-                            feedFrameToEncoder(
-                                yBytes, uBytes, vBytes,
-                                imgWidth, imgHeight,
-                                yStride, uStride, vStride,
-                                uPixelStride,
-                                frameTimestampNs
-                            )
-                        }
-                    }
-                }
+                processYuvFrame(yBytes, uBytes, vBytes, imgWidth, imgHeight,
+                    yStride, uStride, vStride, uPixelStride, frameTimestampNs)
 
                 } catch (e: IllegalStateException) {
                     // Image 可能在处理过程中被关闭（退出时竞态）
@@ -756,16 +834,17 @@ class Camera2ResView(context: Context?, attrs: AttributeSet?) : SurfaceView(cont
      */
     @JvmOverloads
     fun captureRawImage(filePath: String, quality: Int = 90, callback: (File?) -> Unit) {
-        if (mCameraDevice == null) {
+        if (mCameraDevice == null && !(externalInputEnabled && mEnabled && externalHasFrame)) {
             Log.w(TAG, "captureRawImage: camera not connected")
             callback(null)
             return
         }
         synchronized(mRecordingLock) {
-            mPendingCapturePath = filePath
             mPendingCaptureQuality = quality
             mCaptureCallbackHandler = Handler(android.os.Looper.getMainLooper())
             mCaptureCallback = callback
+            // 最后发布待截图标记，确保相机线程读取到完整回调信息。
+            mPendingCapturePath = filePath
         }
         Log.i(TAG, "Raw frame capture requested: $filePath")
     }
