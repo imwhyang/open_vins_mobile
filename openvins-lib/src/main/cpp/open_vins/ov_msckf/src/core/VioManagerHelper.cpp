@@ -92,8 +92,12 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
   }
 
   // Run the initialization in a second thread so it can go as slow as it desires
+  // 上一轮失败后可再次初始化；回收已完成线程后才替换线程句柄。
+  if (thread_init.joinable()) {
+    thread_init.join();
+  }
   thread_init_running = true;
-  std::thread thread([&] {
+  thread_init = std::thread([this] {
     // Returns from our initializer
     double timestamp;
     Eigen::MatrixXd covariance;
@@ -177,12 +181,9 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
     thread_init_running = false;
   });
 
-  // If we are single threaded, then run single threaded
-  // Otherwise detach this thread so it runs in the background!
+  // 保留异步初始化；单线程模式立即等待，多线程模式由下轮初始化或析构负责回收。
   if (!params.use_multi_threading_subs) {
-    thread.join();
-  } else {
-    thread.detach();
+    thread_init.join();
   }
   return false;
 }

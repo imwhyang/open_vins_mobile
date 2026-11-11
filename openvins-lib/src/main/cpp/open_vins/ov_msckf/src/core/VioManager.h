@@ -31,6 +31,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include "VioManagerOptions.h"
 
@@ -68,6 +69,14 @@ public:
    * @param params_ Parameters loaded from either ROS or CMDLINE
    */
   VioManager(VioManagerOptions &params_);
+
+  // 初始化线程访问本对象的状态及互斥锁；先等待线程退出，再销毁任何成员。
+  // 停止采集或重建估计器时不能 detach，否则会访问已释放对象并触发 native 崩溃。
+  ~VioManager() {
+    if (thread_init.joinable()) {
+      thread_init.join();
+    }
+  }
 
   /**
    * @brief Feed function for inertial data
@@ -257,6 +266,8 @@ protected:
 
   // Threads and their atomics
   std::atomic<bool> thread_init_running, thread_init_success;
+  // 由 VioManager 持有线程，保证异步初始化与对象生命周期一致。
+  std::thread thread_init;
 
   // If we did a zero velocity update
   bool did_zupt_update = false;
